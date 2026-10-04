@@ -1,1 +1,1199 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>پتی | ربات‌ساز روبیکا</title>
 
+<style>
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+}
+
+body{
+  font-family:Tahoma,Arial,sans-serif;
+  background:#080b12;
+  color:#fff;
+}
+
+button,input,textarea{
+  font-family:inherit;
+}
+
+button{
+  cursor:pointer;
+}
+
+.app{
+  display:flex;
+  min-height:100vh;
+}
+
+/* Sidebar */
+.sidebar{
+  width:240px;
+  background:#0d111a;
+  border-left:1px solid #202938;
+  padding:22px 15px;
+  position:fixed;
+  right:0;
+  top:0;
+  bottom:0;
+}
+
+.logo{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:10px;
+  margin-bottom:30px;
+}
+
+.logo-icon{
+  width:45px;
+  height:45px;
+  border-radius:14px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  background:linear-gradient(135deg,#765cff,#20d9b0);
+  font-size:22px;
+  font-weight:bold;
+}
+
+.logo small{
+  display:block;
+  color:#7e899e;
+  margin-top:4px;
+}
+
+.nav{
+  width:100%;
+  padding:14px;
+  margin:4px 0;
+  border:0;
+  border-radius:12px;
+  background:transparent;
+  color:#8d98aa;
+  text-align:right;
+}
+
+.nav:hover,
+.nav.active{
+  background:#191f2d;
+  color:white;
+}
+
+.version{
+  position:absolute;
+  bottom:20px;
+  width:calc(100% - 30px);
+  text-align:center;
+  color:#566174;
+  font-size:11px;
+}
+
+/* Main */
+main{
+  margin-right:240px;
+  width:calc(100% - 240px);
+  padding:35px;
+  max-width:1400px;
+}
+
+header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:25px;
+}
+
+header h1{
+  font-size:28px;
+}
+
+header p{
+  color:#7f8a9e;
+  margin-top:7px;
+}
+
+/* Buttons */
+.primary{
+  border:0;
+  padding:13px 20px;
+  border-radius:12px;
+  color:#fff;
+  font-weight:bold;
+  background:linear-gradient(135deg,#725cff,#5144dc);
+}
+
+.primary:hover{
+  opacity:.9;
+}
+
+/* Pages */
+.page{
+  display:none;
+}
+
+.page.active{
+  display:block;
+}
+
+/* Hero */
+.hero{
+  min-height:330px;
+  border:1px solid #202938;
+  border-radius:25px;
+  padding:45px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  background:
+    radial-gradient(circle at 20% 20%,#4236a833,transparent 35%),
+    #101620;
+}
+
+.badge{
+  color:#8d80ff;
+  font-size:12px;
+}
+
+.hero h2{
+  font-size:40px;
+  line-height:1.5;
+  margin:15px 0;
+}
+
+.hero h2 span{
+  color:#8172ff;
+}
+
+.hero p{
+  max-width:600px;
+  color:#8994a7;
+  line-height:2;
+}
+
+.robot{
+  font-size:140px;
+}
+
+/* Stats */
+.stats{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:15px;
+  margin-top:20px;
+}
+
+.stat{
+  background:#101620;
+  border:1px solid #202938;
+  border-radius:18px;
+  padding:22px;
+}
+
+.stat b{
+  font-size:27px;
+}
+
+.stat p{
+  color:#748095;
+  margin-top:8px;
+}
+
+/* Cards */
+.cards{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:15px;
+  margin-top:20px;
+}
+
+.card{
+  padding:24px;
+  border-radius:18px;
+  border:1px solid #202938;
+  background:#101620;
+}
+
+.card .icon{
+  font-size:32px;
+  margin-bottom:15px;
+}
+
+.card h3{
+  margin-bottom:8px;
+}
+
+.card p{
+  color:#788499;
+  line-height:1.8;
+}
+
+/* Builder */
+.builder{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:18px;
+}
+
+.panel{
+  background:#101620;
+  border:1px solid #202938;
+  border-radius:18px;
+  padding:22px;
+}
+
+.panel h3{
+  margin-bottom:20px;
+}
+
+label{
+  display:block;
+  color:#a9b2c2;
+  font-size:13px;
+  margin-bottom:15px;
+}
+
+input,textarea{
+  width:100%;
+  margin-top:8px;
+  padding:13px;
+  background:#080c13;
+  color:white;
+  border:1px solid #293448;
+  border-radius:10px;
+  outline:none;
+}
+
+input:focus,
+textarea:focus{
+  border-color:#7565ff;
+}
+
+textarea{
+  min-height:110px;
+  resize:vertical;
+}
+
+.command{
+  padding:13px;
+  background:#0b1018;
+  border:1px solid #222d40;
+  border-radius:12px;
+  margin-bottom:9px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+
+.command small{
+  display:block;
+  color:#78859a;
+  margin-top:5px;
+}
+
+.delete{
+  border:0;
+  background:none;
+  color:#ff687d;
+}
+
+.empty{
+  text-align:center;
+  color:#68758a;
+  padding:25px;
+}
+
+.phone{
+  max-width:360px;
+  margin:auto;
+  border:7px solid #05070b;
+  border-radius:27px;
+  overflow:hidden;
+  background:#15202d;
+}
+
+.phone-head{
+  padding:15px;
+  background:#202c3c;
+}
+
+.online{
+  color:#45d99a;
+  font-size:10px;
+}
+
+.chat{
+  padding:20px;
+  min-height:220px;
+}
+
+.message{
+  padding:13px;
+  background:#29384e;
+  border-radius:15px;
+  margin-bottom:12px;
+  line-height:1.8;
+}
+
+.preview-button{
+  width:100%;
+  border:1px solid #43536d;
+  background:#303e55;
+  color:#fff;
+  padding:10px;
+  border-radius:9px;
+  margin-top:7px;
+}
+
+/* Help */
+.help{
+  background:#101620;
+  border:1px solid #202938;
+  padding:25px;
+  border-radius:18px;
+  line-height:2.5;
+}
+
+.help p{
+  color:#8994a8;
+  margin-top:15px;
+}
+
+/* Mobile */
+@media(max-width:800px){
+
+  .sidebar{
+    width:65px;
+    padding:15px 7px;
+  }
+
+  .logo div:not(.logo-icon),
+  .nav span,
+  .version{
+    display:none;
+  }
+
+  .logo{
+    justify-content:center;
+  }
+
+  .nav{
+    text-align:center;
+  }
+
+  main{
+    margin-right:65px;
+    width:calc(100% - 65px);
+    padding:18px;
+  }
+
+  header h1{
+    font-size:21px;
+  }
+
+  header p{
+    font-size:11px;
+  }
+
+  .hero{
+    padding:25px;
+  }
+
+  .hero h2{
+    font-size:28px;
+  }
+
+  .robot{
+    font-size:70px;
+  }
+
+  .stats,
+  .cards,
+  .builder{
+    grid-template-columns:1fr;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<div class="app">
+
+<aside class="sidebar">
+
+  <div class="logo">
+    <div class="logo-icon">P</div>
+    <div>
+      <b>PETI</b>
+      <small>ربات‌ساز روبیکا</small>
+    </div>
+  </div>
+
+  <button class="nav active" data-page="home">
+    🏠 <span>داشبورد</span>
+  </button>
+
+  <button class="nav" data-page="builder">
+    🤖 <span>ربات‌ساز</span>
+  </button>
+
+  <button class="nav" data-page="bots">
+    📦 <span>ربات‌های من</span>
+  </button>
+
+  <button class="nav" data-page="help">
+    ❓ <span>آموزش</span>
+  </button>
+
+  <div class="version">
+    PETI BOT BUILDER
+  </div>
+
+</aside>
+
+
+<main>
+
+<header>
+  <div>
+    <h1 id="title">داشبورد</h1>
+    <p id="subtitle">ساخت و مدیریت ربات‌های روبیکا</p>
+  </div>
+
+  <button class="primary" id="newBot">
+    + ساخت ربات
+  </button>
+</header>
+
+
+<!-- HOME -->
+
+<section class="page active" id="home">
+
+  <div class="hero">
+
+    <div>
+
+      <div class="badge">
+        PETI • RUBIKA BOT BUILDER
+      </div>
+
+      <h2>
+        ربات روبیکای خودت رو
+        <span>بساز!</span>
+      </h2>
+
+      <p>
+        بدون نیاز به کدنویسی، اطلاعات رباتت را وارد کن،
+        دستورات اضافه کن و رباتت را مدیریت کن.
+      </p>
+
+      <br>
+
+      <button class="primary" id="start">
+        شروع ساخت ربات 🚀
+      </button>
+
+    </div>
+
+    <div class="robot">
+      🤖
+    </div>
+
+  </div>
+
+
+  <div class="stats">
+
+    <div class="stat">
+      <b id="botCount">0</b>
+      <p>ربات ساخته‌شده</p>
+    </div>
+
+    <div class="stat">
+      <b id="commandCount">0</b>
+      <p>دستور ثبت‌شده</p>
+    </div>
+
+    <div class="stat">
+      <b>100%</b>
+      <p>رایگان</p>
+    </div>
+
+  </div>
+
+
+  <h2 style="margin-top:30px">
+    امکانات
+  </h2>
+
+  <div class="cards">
+
+    <div class="card">
+      <div class="icon">⚡</div>
+      <h3>ساخت سریع</h3>
+      <p>
+        اطلاعات ربات را وارد کن و در چند مرحله
+        ربات خودت را آماده کن.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="icon">⚙️</div>
+      <h3>مدیریت دستورات</h3>
+      <p>
+        دستورات مختلف برای ربات ایجاد و مدیریت کن.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="icon">📱</div>
+      <h3>پیش‌نمایش</h3>
+      <p>
+        قبل از ذخیره، ظاهر پیام‌های ربات را ببین.
+      </p>
+    </div>
+
+  </div>
+
+</section>
+
+
+<!-- BUILDER -->
+
+<section class="page" id="builder">
+
+  <div class="builder">
+
+    <div>
+
+      <div class="panel">
+
+        <h3>⚙️ اطلاعات ربات</h3>
+
+        <label>
+          نام ربات
+          <input
+            id="botName"
+            placeholder="مثلاً پتی"
+          >
+        </label>
+
+        <label>
+          آیدی ربات
+          <input
+            id="botUsername"
+            placeholder="@MyBot"
+          >
+        </label>
+
+        <label>
+          پیام شروع
+          <textarea
+            id="startMessage"
+            placeholder="سلام! به ربات من خوش آمدید 🤖"
+          ></textarea>
+        </label>
+
+        <button
+          class="primary"
+          style="width:100%"
+          id="saveBot"
+        >
+          ذخیره ربات
+        </button>
+
+      </div>
+
+
+      <div class="panel">
+
+        <div style="
+          display:flex;
+          justify-content:space-between;
+          align-items:center;
+          margin-bottom:18px;
+        ">
+
+          <h3 style="margin:0">
+            📋 دستورات
+          </h3>
+
+          <button
+            class="primary"
+            id="addCommand"
+          >
+            + افزودن
+          </button>
+
+        </div>
+
+        <div id="commands"></div>
+
+        <div
+          id="empty"
+          class="empty"
+        >
+          هنوز دستوری اضافه نکردی.
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <div class="panel">
+
+      <h3>📱 پیش‌نمایش ربات</h3>
+
+      <div class="phone">
+
+        <div class="phone-head">
+
+          <b id="previewName">
+            ربات من
+          </b>
+
+          <div class="online">
+            ● آنلاین
+          </div>
+
+        </div>
+
+        <div class="chat">
+
+          <div
+            class="message"
+            id="previewMessage"
+          >
+            سلام! به ربات من خوش آمدید 🤖
+          </div>
+
+          <div id="previewButtons"></div>
+
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+</section>
+
+
+<!-- BOTS -->
+
+<section class="page" id="bots">
+
+  <div class="panel">
+
+    <h3>🤖 ربات‌های من</h3>
+
+    <div id="botList">
+      <div class="empty">
+        هنوز رباتی نساختی.
+      </div>
+    </div>
+
+  </div>
+
+</section>
+
+
+<!-- HELP -->
+
+<section class="page" id="help">
+
+  <div class="help">
+
+    <h2>📚 آموزش</h2>
+
+    <p>
+      برای ساخت ربات:
+    </p>
+
+    <ol>
+      <li>وارد بخش ربات‌ساز شو.</li>
+      <li>نام ربات را وارد کن.</li>
+      <li>آیدی ربات را وارد کن.</li>
+      <li>پیام شروع را بنویس.</li>
+      <li>دستورات دلخواهت را اضافه کن.</li>
+      <li>روی ذخیره ربات بزن.</li>
+    </ol>
+
+    <p>
+      توجه: این نسخه اطلاعات ربات‌ها را داخل مرورگر
+      ذخیره می‌کند. برای اتصال واقعی به API روبیکا،
+      بعداً باید بخش Backend و API را اضافه کنیم.
+    </p>
+
+  </div>
+
+</section>
+
+</main>
+</div>
+
+
+<!-- MODAL -->
+
+<div
+  id="modal"
+  style="
+    display:none;
+    position:fixed;
+    inset:0;
+    background:#000b;
+    align-items:center;
+    justify-content:center;
+    padding:20px;
+  "
+>
+
+  <div
+    style="
+      width:100%;
+      max-width:450px;
+      background:#101620;
+      border:1px solid #293448;
+      border-radius:20px;
+      padding:25px;
+    "
+  >
+
+    <h3 style="margin-bottom:20px">
+      ➕ افزودن دستور
+    </h3>
+
+    <input
+      id="commandName"
+      placeholder="مثلاً /start"
+      style="margin-bottom:12px"
+    >
+
+    <textarea
+      id="commandReply"
+      placeholder="پاسخ ربات..."
+      style="min-height:120px"
+    ></textarea>
+
+    <br><br>
+
+    <button
+      class="primary"
+      id="confirm"
+    >
+      افزودن دستور
+    </button>
+
+    <button
+      class="delete"
+      id="close"
+      style="margin-right:15px"
+    >
+      انصراف
+    </button>
+
+  </div>
+
+</div>
+
+
+<script>
+
+let bots =
+JSON.parse(
+  localStorage.getItem("petiBots") || "[]"
+);
+
+let commands = [];
+
+
+/* تغییر صفحه */
+
+document.querySelectorAll(".nav")
+.forEach(btn => {
+
+  btn.onclick = () => {
+
+    let page = btn.dataset.page;
+
+    document.querySelectorAll(".page")
+    .forEach(p => p.classList.remove("active"));
+
+    document.getElementById(page)
+    .classList.add("active");
+
+    document.querySelectorAll(".nav")
+    .forEach(n => n.classList.remove("active"));
+
+    btn.classList.add("active");
+
+    let titles = {
+      home:["داشبورد","ساخت و مدیریت ربات‌های روبیکا"],
+      builder:["ربات‌ساز","ساخت ربات جدید"],
+      bots:["ربات‌های من","مدیریت ربات‌های ساخته‌شده"],
+      help:["آموزش","راهنمای استفاده از ربات‌ساز"]
+    };
+
+    document.getElementById("title")
+    .textContent = titles[page][0];
+
+    document.getElementById("subtitle")
+    .textContent = titles[page][1];
+
+    if(page === "bots")
+      renderBots();
+
+  };
+
+});
+
+
+/* رفتن به ربات‌ساز */
+
+document.getElementById("start").onclick =
+document.getElementById("newBot").onclick = () => {
+
+  document.querySelector('[data-page="builder"]').click();
+
+};
+
+
+/* افزودن دستور */
+
+document.getElementById("addCommand").onclick = () => {
+
+  document.getElementById("modal").style.display = "flex";
+
+};
+
+
+/* بستن */
+
+document.getElementById("close").onclick = () => {
+
+  document.getElementById("modal").style.display = "none";
+
+};
+
+
+/* ثبت دستور */
+
+document.getElementById("confirm").onclick = () => {
+
+  let name =
+    document.getElementById("commandName")
+    .value.trim();
+
+  let reply =
+    document.getElementById("commandReply")
+    .value.trim();
+
+  if(!name || !reply){
+
+    alert("لطفاً دستور و پاسخ را وارد کن.");
+
+    return;
+  }
+
+  commands.push({
+    name:name,
+    reply:reply
+  });
+
+  document.getElementById("commandName").value = "";
+
+  document.getElementById("commandReply").value = "";
+
+  document.getElementById("modal").style.display = "none";
+
+  renderCommands();
+
+};
+
+
+/* نمایش دستورات */
+
+function renderCommands(){
+
+  let box =
+    document.getElementById("commands");
+
+  box.innerHTML = "";
+
+  document.getElementById("empty").style.display =
+    commands.length ? "none" : "block";
+
+  commands.forEach((cmd,index) => {
+
+    let div =
+      document.createElement("div");
+
+    div.className = "command";
+
+    div.innerHTML = `
+      <div>
+        <b>${escapeHTML(cmd.name)}</b>
+        <small>${escapeHTML(cmd.reply)}</small>
+      </div>
+
+      <button
+        class="delete"
+        onclick="deleteCommand(${index})"
+      >
+        حذف
+      </button>
+    `;
+
+    box.appendChild(div);
+
+  });
+
+  updatePreview();
+
+}
+
+
+/* حذف دستور */
+
+function deleteCommand(index){
+
+  commands.splice(index,1);
+
+  renderCommands();
+
+}
+
+
+/* پیش‌نمایش */
+
+function updatePreview(){
+
+  let name =
+    document.getElementById("botName")
+    .value.trim();
+
+  let message =
+    document.getElementById("startMessage")
+    .value.trim();
+
+  document.getElementById("previewName")
+    .textContent =
+    name || "ربات من";
+
+  document.getElementById("previewMessage")
+    .textContent =
+    message ||
+    "سلام! به ربات من خوش آمدید 🤖";
+
+  let box =
+    document.getElementById("previewButtons");
+
+  box.innerHTML = "";
+
+  commands.forEach(cmd => {
+
+    let button =
+      document.createElement("button");
+
+    button.className =
+      "preview-button";
+
+    button.textContent =
+      cmd.name;
+
+    box.appendChild(button);
+
+  });
+
+}
+
+
+document.getElementById("botName")
+.addEventListener("input",updatePreview);
+
+document.getElementById("startMessage")
+.addEventListener("input",updatePreview);
+
+
+/* ذخیره ربات */
+
+document.getElementById("saveBot").onclick = () => {
+
+  let name =
+    document.getElementById("botName")
+    .value.trim();
+
+  let username =
+    document.getElementById("botUsername")
+    .value.trim();
+
+  let start =
+    document.getElementById("startMessage")
+    .value.trim();
+
+  if(!name || !username){
+
+    alert("نام و آیدی ربات را وارد کن.");
+
+    return;
+
+  }
+
+  let bot = {
+
+    id:Date.now(),
+
+    name:name,
+
+    username:username,
+
+    start:start,
+
+    commands:[...commands]
+
+  };
+
+  bots.push(bot);
+
+  localStorage.setItem(
+    "pətiBots",
+    JSON.stringify(bots)
+  );
+
+  /* نسخه صحیح ذخیره */
+  localStorage.setItem(
+    "petiBots",
+    JSON.stringify(bots)
+  );
+
+  alert("ربات با موفقیت ذخیره شد! ✅");
+
+  document.querySelector('[data-page="bots"]').click();
+
+};
+
+
+/* نمایش ربات‌ها */
+
+function renderBots(){
+
+  let box =
+    document.getElementById("botList");
+
+  box.innerHTML = "";
+
+  if(bots.length === 0){
+
+    box.innerHTML =
+      '<div class="empty">هنوز رباتی نساختی.</div>';
+
+    return;
+
+  }
+
+  bots.forEach((bot,index) => {
+
+    let div =
+      document.createElement("div");
+
+    div.className = "command";
+
+    div.innerHTML = `
+      <div>
+        <b>🤖 ${escapeHTML(bot.name)}</b>
+        <small>
+          ${escapeHTML(bot.username)}
+          · ${bot.commands.length} دستور
+        </small>
+      </div>
+
+      <button
+        class="delete"
+        onclick="deleteBot(${index})"
+      >
+        حذف
+      </button>
+    `;
+
+    box.appendChild(div);
+
+  });
+
+  updateStats();
+
+}
+
+
+/* حذف ربات */
+
+function deleteBot(index){
+
+  bots.splice(index,1);
+
+  localStorage.setItem(
+    "petiBots",
+    JSON.stringify(bots)
+  );
+
+  renderBots();
+
+}
+
+
+/* آمار */
+
+function updateStats(){
+
+  document.getElementById("botCount")
+    .textContent = bots.length;
+
+  let total = bots.reduce(
+    (sum,bot) =>
+      sum + bot.commands.length,
+    0
+  );
+
+  document.getElementById("commandCount")
+    .textContent = total;
+
+}
+
+
+/* امنیت */
+
+function escapeHTML(text){
+
+  return String(text).replace(
+    /[&<>"']/g,
+    char => ({
+      "&":"&amp;",
+      "<":"&lt;",
+      ">":"&gt;",
+      '"':"&quot;",
+      "'":"&#039;"
+    }[char])
+  );
+
+}
+
+
+/* شروع */
+
+updateStats();
+
+updatePreview();
+
+</script>
+
+</body>
+  </html>
