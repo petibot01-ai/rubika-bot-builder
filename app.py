@@ -1,130 +1,253 @@
-import os
-import time
-import threading
-import requests
-
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import uvicorn
+import requests
+import threading
+import time
+import json
+from typing import Optional
 
-
-# =========================================================
-# PETI RUBIKA BOT BUILDER
-# Single File Version
-# =========================================================
-
-app = FastAPI(title="Peti Bot Builder")
+app = FastAPI(title="Peti Rubika Bot Builder")
 
 API_BASE = "https://botapi.rubika.ir/v3"
 
-# توکن‌ها فقط در حافظه نگهداری می‌شوند
-# برای امنیت، توکن را داخل کد ننویس.
+# توکن‌ها و وضعیت ربات‌ها
 bots = {}
+lock = threading.Lock()
 
 
-# =========================================================
-# RUBIKA API
-# =========================================================
+# =========================
+# Rubika API
+# =========================
 
-def rubika_request(token: str, method: str, data: dict | None = None):
-    """
-    درخواست به API ربات روبیکا
-    """
+def rubika_request(token: str, method: str, data=None):
+    token = token.strip()
+
     url = f"{API_BASE}/{token}/{method}"
 
+    response = requests.post(
+        url,
+        json=data or {},
+        headers={"Content-Type": "application/json"},
+        timeout=30
+    )
+
     try:
-        response = requests.post(
-            url,
-            json=data or {},
-            timeout=20
+        result = response.json()
+    except Exception:
+        raise Exception(
+            f"پاسخ نامعتبر از روبیکا: HTTP {response.status_code}"
         )
 
-        text = response.text
+    if response.status_code >= 400:
+        raise Exception(
+            f"HTTP {response.status_code}: {result}"
+        )
 
-        try:
-            result = response.json()
-        except Exception:
-            return {
-                "ok": False,
-                "error": "پاسخ API به صورت JSON نبود",
-                "http_status": response.status_code,
-                "raw": text[:1000]
-            }
-
-        # بعضی نسخه‌های API از status استفاده می‌کنند
-        if isinstance(result, dict):
-            if result.get("status") == "OK":
-                return {
-                    "ok": True,
-                    "data": result
-                }
-
-            # بعضی پاسخ‌ها ممکن است data داشته باشند
-            if "data" in result and result.get("status") not in ["ERROR", "FAILED"]:
-                return {
-                    "ok": True,
-                    "data": result
-                }
-
-        return {
-            "ok": False,
-            "http_status": response.status_code,
-            "error": result
-        }
-
-    except requests.exceptions.Timeout:
-        return {
-            "ok": False,
-            "error": "اتصال به سرور روبیکا Timeout شد."
-        }
-
-    except requests.exceptions.ConnectionError:
-        return {
-            "ok": False,
-            "error": "اتصال به سرور روبیکا برقرار نشد."
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+    return result
 
 
-def get_me(token: str):
+def get_me(token):
     return rubika_request(token, "getMe", {})
 
 
-def send_message(token: str, chat_id: str, text: str):
-    return rubika_request(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text
-        }
-    )
-
-
-def get_updates(token: str, offset_id=None):
+def get_updates(token, offset_id=None):
     data = {
-        "limit": 100
+        "limit": 20
     }
 
     if offset_id:
         data["offset_id"] = offset_id
 
+    return rubika_request(token, "getUpdates", data)
+
+
+def send_message(token, chat_id, text):
     return rubika_request(
         token,
-        "getUpdates",
-        data
+        "sendMessage",
+        {
+            "chat_id": str(chat_id),
+            "text": str(text)
+        }
     )
 
 
-# =========================================================
-# MODELS
-# =========================================================
+# =========================
+# استخراج chat_id
+# =========================
+
+def extract_chat_id(update):
+    """
+    ساختار اصلی روبیکا:
+    {
+        "type": "NewMessage",
+        "chat_id": "...",
+        "new_message": {...}
+    }
+
+    علاوه بر آن چند حالت جایگزین هم بررسی می‌شود.
+    """
+
+    if not isinstance(update, dict):
+        return None
+
+    # حالت اصلی
+    chat_id = update.get("chat_id")
+
+    if chat_id:
+        return str(chat_id)
+
+    # حالت‌های احتمالی دیگر
+    for key in [
+        "chatId",
+        "object_guid",
+        "objectGuid"
+    ]:
+        value = update.get(key)
+        if value:
+            return str(value)
+
+    # بررسی داخل message
+    for message_key in [
+        "new_message",
+        "updated_message",
+        "message"
+    ]:
+        message = update.get(message_key)
+
+        if isinstance(message, dict):
+            for key in [
+                "chat_id",
+                "chatId",
+                "object_guid",
+                "objectGuid"
+            ]:
+                value = message.get(key)
+
+                if value:
+                    return str(value)
+
+    return None
+
+
+def extract_text(update):
+    if not isinstance(update, dict):
+        return ""
+
+    for key in [
+        "new_message",
+        "updated_message",
+        "message"
+    ]:
+        message = update.get(key)
+
+        if isinstance(message, dict):
+            text = message.get("text")
+
+            if text:
+                return str(text)
+
+    return str(update.get("text") or "")
+
+
+# =========================
+# دریافت خودکار پیام‌ها
+# =========================
+
+def bot_worker(token):
+    offset_id = None
+
+    print("Peti bot worker started.")
+
+    while True:
+        try:
+            result = get_updates(token, offset_id)
+
+            if not isinstance(result, dict):
+                time.sleep(2)
+                continue
+
+            data = result.get("data")
+
+            if not isinstance(data, dict):
+                data = result
+
+            updates = data.get("updates", [])
+
+            if not isinstance(updates, list):
+                updates = []
+
+            # offset بعدی
+            next_offset = (
+                data.get("next_offset_id")
+                or result.get("next_offset_id")
+            )
+
+            if next_offset:
+                offset_id = str(next_offset)
+
+            for update in updates:
+
+                if not isinstance(update, dict):
+                    continue
+
+                chat_id = extract_chat_id(update)
+
+                if not chat_id:
+                    continue
+
+                text = extract_text(update)
+
+                # ذخیره chat_id
+                with lock:
+                    bot = bots.get(token)
+
+                    if bot is not None:
+                        bot["chat_id"] = chat_id
+                        bot["last_text"] = text
+                        bot["last_update"] = update
+                        bot["updated_at"] = time.time()
+
+                print(
+                    f"[Peti] chat_id found: {chat_id} | text: {text}"
+                )
+
+                # پاسخ‌های ساده
+                if text.strip() == "/start":
+                    try:
+                        send_message(
+                            token,
+                            chat_id,
+                            "سلام 👋\n"
+                            "ربات پتی با موفقیت به شما متصل شد.\n\n"
+                            f"chat_id شما:\n{chat_id}"
+                        )
+                    except Exception as e:
+                        print("Send message error:", e)
+
+                elif text.strip() == "/help":
+                    try:
+                        send_message(
+                            token,
+                            chat_id,
+                            "راهنمای ربات پتی\n\n"
+                            "/start - شروع\n"
+                            "/help - راهنما"
+                        )
+                    except Exception as e:
+                        print("Send message error:", e)
+
+            time.sleep(1)
+
+        except Exception as e:
+            print("Worker error:", e)
+            time.sleep(5)
+
+
+# =========================
+# Models
+# =========================
 
 class TokenRequest(BaseModel):
     token: str
@@ -136,26 +259,22 @@ class SendMessageRequest(BaseModel):
     text: str
 
 
-class SaveBotRequest(BaseModel):
-    token: str
-
-
-# =========================================================
-# API ROUTES
-# =========================================================
+# =========================
+# API Routes
+# =========================
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "Peti Bot Builder"
+        "service": "Peti Rubika Bot Builder"
     }
 
 
 @app.post("/api/verify-token")
-def verify_token(data: TokenRequest):
+def verify_token(req: TokenRequest):
 
-    token = data.token.strip()
+    token = req.token.strip()
 
     if not token:
         return {
@@ -163,241 +282,113 @@ def verify_token(data: TokenRequest):
             "message": "توکن وارد نشده است."
         }
 
-    if len(token) > 500:
+    try:
+        result = get_me(token)
+
+        # ذخیره ربات
+        with lock:
+            if token not in bots:
+                bots[token] = {
+                    "chat_id": None,
+                    "last_text": "",
+                    "last_update": None,
+                    "updated_at": 0,
+                    "worker_started": False
+                }
+
+            # شروع Worker فقط یک بار
+            if not bots[token]["worker_started"]:
+                bots[token]["worker_started"] = True
+
+                thread = threading.Thread(
+                    target=bot_worker,
+                    args=(token,),
+                    daemon=True
+                )
+
+                thread.start()
+
+        data = result.get("data", result)
+
         return {
-            "ok": False,
-            "message": "توکن نامعتبر است."
+            "ok": True,
+            "message": "اتصال با موفقیت انجام شد.",
+            "bot": data,
+            "chat_id": bots[token].get("chat_id")
         }
 
-    result = get_me(token)
+    except Exception as e:
 
-    if not result["ok"]:
+        print("Verify error:", e)
+
         return {
             "ok": False,
-            "message": "توکن معتبر نیست یا API روبیکا درخواست را قبول نکرد.",
-            "details": result
+            "message": str(e)
         }
 
-    bot_data = result.get("data", {})
 
-    bots[token] = {
-        "token": token,
-        "bot": bot_data,
-        "offset_id": None
-    }
+@app.get("/api/chat-id")
+def get_chat_id(token: str):
+
+    token = token.strip()
+
+    if not token:
+        return {
+            "ok": False,
+            "message": "توکن وارد نشده است."
+        }
+
+    with lock:
+        bot = bots.get(token)
+
+        if not bot:
+            return {
+                "ok": False,
+                "message": "ابتدا توکن را متصل کنید."
+            }
+
+        chat_id = bot.get("chat_id")
+
+    if chat_id:
+        return {
+            "ok": True,
+            "chat_id": chat_id
+        }
 
     return {
-        "ok": True,
-        "message": "اتصال با موفقیت انجام شد.",
-        "bot": bot_data
+        "ok": False,
+        "message": "هنوز chat_id پیدا نشده است. یک پیام به ربات بفرستید."
     }
 
 
 @app.post("/api/send-message")
-def api_send_message(data: SendMessageRequest):
+def api_send_message(req: SendMessageRequest):
 
-    token = data.token.strip()
-    chat_id = data.chat_id.strip()
-    text = data.text.strip()
+    try:
 
-    if not token:
-        return {
-            "ok": False,
-            "message": "توکن وارد نشده است."
-        }
-
-    if not chat_id:
-        return {
-            "ok": False,
-            "message": "chat_id وارد نشده است."
-        }
-
-    if not text:
-        return {
-            "ok": False,
-            "message": "متن پیام خالی است."
-        }
-
-    result = send_message(
-        token,
-        chat_id,
-        text
-    )
-
-    if not result["ok"]:
-        return {
-            "ok": False,
-            "message": "ارسال پیام ناموفق بود.",
-            "details": result
-        }
-
-    return {
-        "ok": True,
-        "message": "پیام با موفقیت ارسال شد.",
-        "result": result
-    }
-
-
-# =========================================================
-# SIMPLE BOT POLLING
-# =========================================================
-
-def extract_update_text(update):
-    """
-    تلاش می‌کند متن و chat_id را از ساختارهای مختلف Update پیدا کند.
-    """
-
-    if not isinstance(update, dict):
-        return None, None
-
-    chat_id = update.get("chat_id")
-    text = update.get("text")
-
-    new_message = update.get("new_message")
-
-    if isinstance(new_message, dict):
-
-        if not chat_id:
-            chat_id = new_message.get("chat_id")
-
-        if not text:
-            text = new_message.get("text")
-
-    message = update.get("message")
-
-    if isinstance(message, dict):
-
-        if not chat_id:
-            chat_id = message.get("chat_id")
-
-        if not text:
-            text = message.get("text")
-
-    return text, chat_id
-
-
-def bot_worker(token):
-
-    offset_id = None
-
-    while True:
-
-        try:
-
-            result = get_updates(
-                token,
-                offset_id
-            )
-
-            if not result["ok"]:
-                time.sleep(10)
-                continue
-
-            response = result.get("data", {})
-
-            updates = []
-
-            if isinstance(response, dict):
-
-                data = response.get("data")
-
-                if isinstance(data, dict):
-                    updates = data.get("updates", []) or []
-
-                if not updates:
-                    updates = response.get("updates", []) or []
-
-            if not isinstance(updates, list):
-                updates = []
-
-            for update in updates:
-
-                text, chat_id = extract_update_text(update)
-
-                # پیدا کردن offset
-                if isinstance(update, dict):
-
-                    update_id = (
-                        update.get("update_id")
-                        or update.get("id")
-                        or update.get("message_id")
-                    )
-
-                    if update_id:
-                        offset_id = str(update_id)
-
-                if not text or not chat_id:
-                    continue
-
-                text = str(text).strip()
-
-                # پاسخ ساده به /start
-                if text == "/start":
-                    send_message(
-                        token,
-                        str(chat_id),
-                        "سلام 👋\nبه ربات پتی خوش آمدید."
-                    )
-
-                # پاسخ به /help
-                elif text == "/help":
-                    send_message(
-                        token,
-                        str(chat_id),
-                        "دستورات ربات:\n\n/start\n/help"
-                    )
-
-            time.sleep(2)
-
-        except Exception:
-            time.sleep(10)
-
-
-@app.post("/api/start-bot")
-def start_bot(data: SaveBotRequest):
-
-    token = data.token.strip()
-
-    if not token:
-        return {
-            "ok": False,
-            "message": "توکن وارد نشده است."
-        }
-
-    result = get_me(token)
-
-    if not result["ok"]:
-        return {
-            "ok": False,
-            "message": "ابتدا توکن را بررسی کنید.",
-            "details": result
-        }
-
-    if token not in bots:
-
-        bots[token] = {
-            "token": token,
-            "bot": result.get("data", {}),
-            "offset_id": None
-        }
-
-        thread = threading.Thread(
-            target=bot_worker,
-            args=(token,),
-            daemon=True
+        result = send_message(
+            req.token.strip(),
+            req.chat_id.strip(),
+            req.text
         )
 
-        thread.start()
+        return {
+            "ok": True,
+            "message": "پیام ارسال شد.",
+            "result": result
+        }
 
-    return {
-        "ok": True,
-        "message": "ربات فعال شد."
-    }
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "message": str(e)
+        }
 
 
-# =========================================================
-# FRONTEND
-# =========================================================
+# =========================
+# HTML
+# =========================
 
 HTML = r"""
 <!DOCTYPE html>
@@ -407,10 +398,8 @@ HTML = r"""
 
 <meta charset="UTF-8">
 
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1.0"
->
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
 
 <title>پتی ربات‌ساز روبیکا</title>
 
@@ -422,225 +411,218 @@ content="width=device-width,initial-scale=1.0"
 
 body{
     margin:0;
-    background:#061426;
-    color:#eef8ff;
     font-family:
         Tahoma,
         Arial,
         sans-serif;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #102b45 0,
+            #07111d 45%,
+            #040912 100%
+        );
+
+    color:#fff;
+    min-height:100vh;
 }
 
 .container{
     width:min(900px,94%);
-    margin:auto;
-    padding:25px 0 60px;
+    margin:40px auto;
 }
 
 .header{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    border-bottom:1px solid #123451;
-    padding:15px 5px 25px;
-    margin-bottom:35px;
+    text-align:center;
+    margin-bottom:25px;
 }
 
 .logo{
-    width:55px;
-    height:55px;
-    border:2px solid #16c9ff;
-    border-radius:18px;
+    width:70px;
+    height:70px;
+    margin:auto;
+
     display:flex;
     align-items:center;
     justify-content:center;
-    color:#16c9ff;
-    font-size:25px;
+
+    border-radius:22px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #00e5ff,
+            #0077ff
+        );
+
+    color:#00111d;
+    font-size:32px;
     font-weight:bold;
-}
 
-.brand{
-    font-size:25px;
-    font-weight:bold;
-}
-
-.hero{
-    text-align:center;
-    margin-bottom:35px;
-}
-
-.badge{
-    display:inline-block;
-    border:1px solid #14527a;
-    border-radius:30px;
-    padding:10px 20px;
-    color:#16c9ff;
+    box-shadow:
+        0 0 35px rgba(0,229,255,.35);
 }
 
 h1{
-    font-size:44px;
-    margin:35px 0 20px;
+    margin:15px 0 5px;
+    font-size:30px;
 }
 
-h1 span{
-    color:#13c9ff;
-}
-
-.description{
-    color:#9bb0c8;
-    font-size:19px;
-    line-height:2;
+.subtitle{
+    color:#91a8bd;
 }
 
 .card{
-    background:#061325;
-    border:1px solid #123b5c;
-    border-radius:30px;
-    padding:35px;
-    margin-top:25px;
-    box-shadow:0 10px 35px #0005;
+    background:
+        rgba(9,23,38,.88);
+
+    border:1px solid
+        rgba(0,229,255,.12);
+
+    border-radius:22px;
+
+    padding:22px;
+
+    margin-bottom:18px;
+
+    box-shadow:
+        0 15px 45px rgba(0,0,0,.25);
 }
 
 .card h2{
     margin-top:0;
-    font-size:28px;
+    font-size:19px;
 }
 
 label{
     display:block;
-    margin:22px 0 9px;
-    color:#a8bdd2;
+    margin:12px 0 7px;
+    color:#9db1c4;
 }
 
-input, textarea{
+input,
+textarea{
     width:100%;
-    background:#020c19;
+
+    background:#071421;
+
+    border:1px solid #20394e;
+
     color:white;
-    border:1px solid #194563;
-    border-radius:18px;
-    padding:18px;
-    font-size:16px;
+
+    padding:13px;
+
+    border-radius:13px;
+
     outline:none;
+
+    font-size:15px;
 }
 
 input:focus,
 textarea:focus{
-    border-color:#16c9ff;
-    box-shadow:0 0 0 2px #16c9ff22;
+    border-color:#00d9ff;
 }
 
 textarea{
-    min-height:130px;
     resize:vertical;
-}
-
-.buttons{
-    display:flex;
-    gap:15px;
-    margin-top:22px;
+    min-height:100px;
 }
 
 button{
-    flex:1;
-    padding:17px;
-    border-radius:18px;
-    border:1px solid #16506d;
-    background:#071b2d;
-    color:#c6def0;
-    font-size:17px;
+    border:0;
+
+    padding:13px 18px;
+
+    border-radius:13px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #00d9ff,
+            #0088ff
+        );
+
+    color:#00131d;
+
+    font-weight:bold;
+
     cursor:pointer;
+
+    margin-top:14px;
 }
 
-button.primary{
-    background:linear-gradient(135deg,#0dc4f0,#087ba8);
-    color:white;
-    border-color:#20d4ff;
+button.secondary{
+    background:#152a3b;
+    color:#d9f8ff;
 }
 
 button:hover{
-    filter:brightness(1.15);
+    transform:translateY(-1px);
 }
 
 .status{
-    margin-top:20px;
-    border-radius:18px;
-    padding:18px;
-    display:none;
-    line-height:1.9;
+    padding:14px;
+    border-radius:13px;
+    margin-top:15px;
+
+    background:#081724;
+
+    color:#91a8bd;
 }
 
 .success{
-    display:block;
-    background:#06261e;
-    border:1px solid #13c993;
-    color:#55e8bd;
+    color:#58f2ad;
 }
 
 .error{
-    display:block;
-    background:#2b0710;
-    border:1px solid #ff4662;
-    color:#ff7185;
+    color:#ff7070;
+}
+
+.chatbox{
+    display:flex;
+    gap:10px;
+    align-items:center;
+}
+
+.chatbox input{
+    flex:1;
+}
+
+.copy{
+    margin-top:0;
+    white-space:nowrap;
 }
 
 .bot-info{
+    line-height:2;
+    color:#b7c9d8;
+}
+
+.badge{
+    display:inline-block;
+
+    background:
+        rgba(0,229,255,.1);
+
+    color:#50e9ff;
+
+    padding:5px 10px;
+
+    border-radius:20px;
+
+    font-size:12px;
+}
+
+.hidden{
     display:none;
-}
-
-.info-row{
-    display:flex;
-    justify-content:space-between;
-    padding:17px 0;
-    border-bottom:1px solid #12304a;
-}
-
-.value{
-    color:#fff;
-}
-
-.commands{
-    margin-top:20px;
-}
-
-.command{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    padding:15px;
-    background:#081a2b;
-    border:1px solid #123b58;
-    border-radius:15px;
-    margin-bottom:10px;
-}
-
-.command code{
-    color:#19ccff;
 }
 
 .footer{
     text-align:center;
-    color:#617990;
-    margin-top:40px;
-}
-
-@media(max-width:600px){
-
-    .container{
-        width:92%;
-    }
-
-    h1{
-        font-size:34px;
-    }
-
-    .card{
-        padding:22px;
-        border-radius:24px;
-    }
-
-    .buttons{
-        flex-direction:column;
-    }
-
+    color:#61778b;
+    margin:30px 0;
 }
 
 </style>
@@ -651,292 +633,457 @@ button:hover{
 
 <div class="container">
 
-<header class="header">
+    <div class="header">
 
-<div class="brand">
-پتی ربات‌ساز
-</div>
+        <div class="logo">
+            پ
+        </div>
 
-<div class="logo">
-پ
-</div>
+        <h1>
+            پتی ربات‌ساز
+        </h1>
 
-</header>
+        <div class="subtitle">
+            ساخت و مدیریت ربات روبیکا
+        </div>
 
-
-<section class="hero">
-
-<div class="badge">
-ربات‌ساز حرفه‌ای روبیکا
-</div>
-
-<h1>
-ساخت ربات <span>روبیکا</span>
-</h1>
-
-<div class="description">
-توکن رباتت را وارد کن و ربات خودت را مستقیماً از پنل پتی مدیریت کن.
-<br>
-اتصال و ارسال پیام از طریق سرور انجام می‌شود.
-</div>
-
-</section>
+    </div>
 
 
-<div class="card">
+    <!-- اتصال -->
 
-<h2>
-🔗 اتصال ربات
-</h2>
+    <div class="card">
 
-<label>
-توکن ربات روبیکا
-</label>
+        <h2>
+            🔐 اتصال ربات
+        </h2>
 
-<input
-id="token"
-type="password"
-placeholder="توکن ربات را وارد کنید"
-/>
+        <label>
+            توکن ربات
+        </label>
 
+        <input
+            id="token"
+            type="password"
+            placeholder="توکن ربات روبیکا را وارد کنید"
+        >
 
-<label>
-شناسه چت برای تست پیام
-</label>
+        <button onclick="connectBot()">
+            اتصال و پیدا کردن chat_id
+        </button>
 
-<input
-id="chat_id"
-placeholder="chat_id"
-/>
+        <div
+            id="status"
+            class="status"
+        >
+            ربات هنوز متصل نشده است.
+        </div>
 
-
-<label>
-متن پیام تست
-</label>
-
-<textarea id="message">سلام! 👋
-این پیام از پتی ارسال شد.</textarea>
+    </div>
 
 
-<div class="buttons">
+    <!-- اطلاعات -->
 
-<button
-class="primary"
-onclick="verifyToken()"
->
-🔗 اتصال و بررسی
-</button>
+    <div
+        id="infoCard"
+        class="card hidden"
+    >
 
-<button
-onclick="sendMessage()"
->
-✉️ ارسال پیام
-</button>
+        <h2>
+            🤖 اطلاعات ربات
+        </h2>
 
-</div>
+        <div
+            id="botInfo"
+            class="bot-info"
+        ></div>
 
-
-<div id="status" class="status"></div>
-
-</div>
+    </div>
 
 
-<div
-id="botInfo"
-class="card bot-info"
->
+    <!-- Chat ID -->
 
-<h2>
-🤖 اطلاعات ربات
-</h2>
+    <div
+        id="chatCard"
+        class="card"
+    >
 
-<div class="info-row">
-<span>وضعیت</span>
-<strong
-id="botStatus"
-class="value"
->
-قطع
-</strong>
-</div>
+        <h2>
+            💬 chat_id
+        </h2>
 
-<div class="info-row">
-<span>نام</span>
-<strong
-id="botName"
-class="value"
->
--
-</strong>
-</div>
+        <p style="color:#8ea5b8">
+            یک پیام مثل <b>/start</b> برای ربات بفرستید؛
+            chat_id به صورت خودکار اینجا نمایش داده می‌شود.
+        </p>
 
-<div class="info-row">
-<span>شناسه</span>
-<strong
-id="botId"
-class="value"
->
--
-</strong>
-</div>
+        <div class="chatbox">
 
-<div class="commands">
+            <input
+                id="chatId"
+                readonly
+                placeholder="در انتظار پیام..."
+            >
 
-<h3>
-دستورات فعال
-</h3>
+            <button
+                class="copy secondary"
+                onclick="copyChatId()"
+            >
+                کپی
+            </button>
 
-<div class="command">
-<code>/start</code>
-<span>پیام خوش‌آمدگویی</span>
-</div>
+        </div>
 
-<div class="command">
-<code>/help</code>
-<span>نمایش راهنما</span>
-</div>
+        <div
+            id="chatStatus"
+            class="status"
+        >
+            در انتظار پیام جدید...
+        </div>
 
-</div>
-
-<div class="buttons">
-
-<button
-class="primary"
-onclick="startBot()"
->
-🚀 فعال‌سازی ربات
-</button>
-
-</div>
-
-</div>
+    </div>
 
 
-<div class="footer">
-پتی • ربات‌ساز روبیکا
-</div>
+    <!-- ارسال پیام -->
+
+    <div class="card">
+
+        <h2>
+            ✉️ ارسال پیام آزمایشی
+        </h2>
+
+        <label>
+            متن پیام
+        </label>
+
+        <textarea
+            id="message"
+            placeholder="متن پیام را بنویسید..."
+        >سلام از پتی 👋</textarea>
+
+        <button onclick="sendMessage()">
+            ارسال پیام
+        </button>
+
+        <div
+            id="sendStatus"
+            class="status"
+        >
+            آماده ارسال
+        </div>
+
+    </div>
+
+
+    <div class="footer">
+        ساخته شده با ❤️ برای پتی
+    </div>
 
 </div>
 
 
 <script>
 
-function showStatus(message, type){
+let currentToken = "";
 
-    const box = document.getElementById("status");
-
-    box.className = "status " + type;
-
-    box.innerText = message;
-
-}
+let pollTimer = null;
 
 
-function getToken(){
+/* =========================
+   اتصال ربات
+========================= */
 
-    return document
+async function connectBot(){
+
+    const token =
+        document
         .getElementById("token")
         .value
         .trim();
 
-}
-
-
-async function verifyToken(){
-
-    const token = getToken();
+    const status =
+        document
+        .getElementById("status");
 
     if(!token){
 
-        showStatus(
-            "❌ لطفاً توکن ربات را وارد کنید.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "لطفاً توکن ربات را وارد کنید.";
 
         return;
     }
 
-    showStatus(
-        "⏳ در حال بررسی توکن...",
-        "success"
-    );
+    currentToken = token;
+
+    status.className =
+        "status";
+
+    status.innerText =
+        "در حال اتصال به روبیکا...";
 
     try{
 
-        const response = await fetch(
-            "/api/verify-token",
-            {
-                method:"POST",
-                headers:{
-                    "Content-Type":"application/json"
-                },
-                body:JSON.stringify({
-                    token:token
-                })
-            }
-        );
+        const response =
+            await fetch(
+                "/api/verify-token",
+                {
+                    method:"POST",
 
-        const data = await response.json();
+                    headers:{
+                        "Content-Type":
+                            "application/json"
+                    },
 
-        if(!data.ok){
-
-            console.log(data);
-
-            showStatus(
-                "❌ " +
-                (data.message || "توکن نامعتبر است.") +
-                "\n\nجزئیات در Console مرورگر موجود است.",
-                "error"
+                    body:JSON.stringify({
+                        token:token
+                    })
+                }
             );
+
+        const result =
+            await response.json();
+
+        if(!result.ok){
+
+            status.className =
+                "status error";
+
+            status.innerText =
+                result.message ||
+                "اتصال ناموفق بود.";
 
             return;
         }
 
-        const bot = data.bot || {};
-        const botData = bot.data || bot;
+        status.className =
+            "status success";
 
-        document.getElementById("botInfo").style.display = "block";
+        status.innerText =
+            "✅ ربات متصل شد. حالا یک پیام برای ربات بفرستید.";
 
-        document.getElementById("botStatus").innerText =
-            "متصل ✓";
+        showBotInfo(result.bot);
 
-        document.getElementById("botStatus").style.color =
-            "#35e6b3";
+        if(result.chat_id){
 
-        document.getElementById("botName").innerText =
-            botData.name ||
-            botData.username ||
-            "-";
+            setChatId(result.chat_id);
 
-        document.getElementById("botId").innerText =
-            botData.bot_id ||
-            botData.id ||
-            "-";
+        }
 
-        showStatus(
-            "✅ اتصال با موفقیت انجام شد.",
-            "success"
-        );
+        startPolling();
 
     }catch(error){
 
-        showStatus(
-            "❌ خطا در اتصال به سرور پتی.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "خطا در ارتباط با سرور.";
 
         console.error(error);
     }
 }
 
 
+/* =========================
+   نمایش اطلاعات ربات
+========================= */
+
+function showBotInfo(bot){
+
+    const card =
+        document
+        .getElementById("infoCard");
+
+    const box =
+        document
+        .getElementById("botInfo");
+
+    card.classList.remove("hidden");
+
+    if(!bot){
+
+        box.innerHTML =
+            "اطلاعات ربات دریافت شد.";
+
+        return;
+    }
+
+    const name =
+        bot.name ||
+        bot.first_name ||
+        "نامشخص";
+
+    const username =
+        bot.username ||
+        bot.user_name ||
+        "نامشخص";
+
+    box.innerHTML = `
+        <div>
+            نام:
+            <span class="badge">
+                ${escapeHtml(name)}
+            </span>
+        </div>
+
+        <div>
+            username:
+            <span class="badge">
+                ${escapeHtml(username)}
+            </span>
+        </div>
+    `;
+}
+
+
+/* =========================
+   گرفتن chat_id
+========================= */
+
+async function pollChatId(){
+
+    if(!currentToken){
+        return;
+    }
+
+    try{
+
+        const response =
+            await fetch(
+                "/api/chat-id?token=" +
+                encodeURIComponent(currentToken)
+            );
+
+        const result =
+            await response.json();
+
+        if(result.ok && result.chat_id){
+
+            setChatId(result.chat_id);
+
+            const status =
+                document
+                .getElementById("chatStatus");
+
+            status.className =
+                "status success";
+
+            status.innerText =
+                "✅ chat_id با موفقیت پیدا شد.";
+
+            stopPolling();
+        }
+
+    }catch(error){
+
+        console.log(error);
+    }
+}
+
+
+function startPolling(){
+
+    stopPolling();
+
+    pollTimer =
+        setInterval(
+            pollChatId,
+            2000
+        );
+
+    pollChatId();
+}
+
+
+function stopPolling(){
+
+    if(pollTimer){
+
+        clearInterval(pollTimer);
+
+        pollTimer = null;
+    }
+}
+
+
+/* =========================
+   نمایش chat_id
+========================= */
+
+function setChatId(chatId){
+
+    document
+        .getElementById("chatId")
+        .value = chatId;
+
+    localStorage.setItem(
+        "peti_chat_id",
+        chatId
+    );
+}
+
+
+/* =========================
+   کپی
+========================= */
+
+async function copyChatId(){
+
+    const input =
+        document
+        .getElementById("chatId");
+
+    if(!input.value){
+
+        alert(
+            "هنوز chat_id پیدا نشده است."
+        );
+
+        return;
+    }
+
+    try{
+
+        await navigator.clipboard.writeText(
+            input.value
+        );
+
+        alert(
+            "chat_id کپی شد."
+        );
+
+    }catch(error){
+
+        input.select();
+
+        document.execCommand("copy");
+
+        alert(
+            "chat_id کپی شد."
+        );
+    }
+}
+
+
+/* =========================
+   ارسال پیام
+========================= */
+
 async function sendMessage(){
 
-    const token = getToken();
-
-    const chat_id =
+    const token =
+        currentToken ||
         document
-        .getElementById("chat_id")
+        .getElementById("token")
+        .value
+        .trim();
+
+    const chatId =
+        document
+        .getElementById("chatId")
         .value
         .trim();
 
@@ -946,185 +1093,164 @@ async function sendMessage(){
         .value
         .trim();
 
+    const status =
+        document
+        .getElementById("sendStatus");
+
     if(!token){
 
-        showStatus(
-            "❌ ابتدا توکن را وارد کنید.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "ابتدا ربات را متصل کنید.";
 
         return;
     }
 
-    if(!chat_id){
+    if(!chatId){
 
-        showStatus(
-            "❌ chat_id را وارد کنید.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "ابتدا یک پیام برای ربات بفرستید تا chat_id پیدا شود.";
 
         return;
     }
 
     if(!text){
 
-        showStatus(
-            "❌ متن پیام خالی است.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "متن پیام خالی است.";
 
         return;
     }
 
-    showStatus(
-        "⏳ در حال ارسال پیام...",
-        "success"
-    );
+    status.className =
+        "status";
+
+    status.innerText =
+        "در حال ارسال...";
 
     try{
 
-        const response = await fetch(
-            "/api/send-message",
-            {
-                method:"POST",
-                headers:{
-                    "Content-Type":"application/json"
-                },
-                body:JSON.stringify({
-                    token:token,
-                    chat_id:chat_id,
-                    text:text
-                })
-            }
-        );
+        const response =
+            await fetch(
+                "/api/send-message",
+                {
+                    method:"POST",
 
-        const data = await response.json();
+                    headers:{
+                        "Content-Type":
+                            "application/json"
+                    },
 
-        if(!data.ok){
-
-            console.log(data);
-
-            showStatus(
-                "❌ ارسال پیام انجام نشد.\n" +
-                "جزئیات خطا در Console موجود است.",
-                "error"
+                    body:JSON.stringify({
+                        token:token,
+                        chat_id:chatId,
+                        text:text
+                    })
+                }
             );
 
-            return;
-        }
+        const result =
+            await response.json();
 
-        showStatus(
-            "✅ پیام با موفقیت ارسال شد.",
-            "success"
-        );
+        if(result.ok){
+
+            status.className =
+                "status success";
+
+            status.innerText =
+                "✅ پیام با موفقیت ارسال شد.";
+
+        }else{
+
+            status.className =
+                "status error";
+
+            status.innerText =
+                result.message ||
+                "ارسال پیام ناموفق بود.";
+        }
 
     }catch(error){
 
-        showStatus(
-            "❌ خطا در ارسال درخواست.",
-            "error"
-        );
+        status.className =
+            "status error";
+
+        status.innerText =
+            "خطا در ارتباط با سرور.";
 
         console.error(error);
     }
 }
 
 
-async function startBot(){
+/* =========================
+   جلوگیری از XSS
+========================= */
 
-    const token = getToken();
+function escapeHtml(value){
 
-    if(!token){
+    return String(value)
+        .replaceAll("&","&amp;")
+        .replaceAll("<","&lt;")
+        .replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;")
+        .replaceAll("'","&#039;");
+}
 
-        showStatus(
-            "❌ ابتدا توکن را وارد کنید.",
-            "error"
-        );
 
-        return;
-    }
+/* =========================
+   بازیابی chat_id
+========================= */
 
-    showStatus(
-        "⏳ در حال فعال‌سازی ربات...",
-        "success"
-    );
+window.addEventListener(
+    "load",
+    () => {
 
-    try{
-
-        const response = await fetch(
-            "/api/start-bot",
-            {
-                method:"POST",
-                headers:{
-                    "Content-Type":"application/json"
-                },
-                body:JSON.stringify({
-                    token:token
-                })
-            }
-        );
-
-        const data = await response.json();
-
-        if(!data.ok){
-
-            showStatus(
-                "❌ " + data.message,
-                "error"
+        const saved =
+            localStorage.getItem(
+                "peti_chat_id"
             );
 
-            return;
+        if(saved){
+
+            setChatId(saved);
         }
 
-        showStatus(
-            "🟢 ربات فعال شد.\n" +
-            "دستورات /start و /help فعال هستند.",
-            "success"
-        );
-
-    }catch(error){
-
-        showStatus(
-            "❌ خطا در فعال‌سازی ربات.",
-            "error"
-        );
-
-        console.error(error);
     }
-}
+);
 
 </script>
 
 </body>
-
 </html>
 """
 
-
-# =========================================================
-# HOME
-# =========================================================
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTML
 
 
-# =========================================================
-# START
-# =========================================================
+# =========================
+# Run
+# =========================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
+    import uvicorn
+
+    port = 8000
 
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port
-    )
+)
