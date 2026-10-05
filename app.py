@@ -1,30 +1,182 @@
 import os
-import time
+import sqlite3
 import threading
-from typing import Optional
+import time
+from typing import Optional, Any
 
 import requests
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-
 # =========================================================
-# PETI RUBIKA BOT BUILDER
-# Single-file Render version
+# PETI BOT BUILDER
+# ربات ساز پتی - نسخه یک فایل
+# Render Ready / Persian RTL / Rubika Bot API
 # =========================================================
 
-app = FastAPI(title="Peti Rubika Bot Builder")
+app = FastAPI(title="Peti Bot Builder")
 
 API_BASE = "https://botapi.rubika.ir/v3"
+DB_PATH = os.environ.get("PETI_DB", "peti.db")
 
-# ---------------------------------------------------------
-# حافظه موقت برنامه
-# توجه: روی Render Free با Restart/Spin-down پاک می‌شود.
-# ---------------------------------------------------------
+db_lock = threading.Lock()
+worker_lock = threading.Lock()
 
-bots = {}
-lock = threading.Lock()
+worker_started = False
+active_token = ""
+bot_info: dict[str, Any] = {}
+last_update_offset: Optional[str] = None
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db_lock:
+        conn = db()
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id TEXT PRIMARY KEY,
+                name TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                last_text TEXT DEFAULT '',
+                updated_at INTEGER DEFAULT 0,
+                messages INTEGER DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT ''
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+
+def upsert_chat(
+    chat_id,
+    name="",
+    username="",
+    text=""
+):
+    now = int(time.time())
+
+    with db_lock:
+        conn = db()
+
+        old = conn.execute(
+            "SELECT messages FROM chats WHERE chat_id=?",
+            (str(chat_id),)
+        ).fetchone()
+
+        count = (old["messages"] if old else 0) + 1
+
+        conn.execute("""
+            INSERT INTO chats(
+                chat_id,
+                name,
+                username,
+                last_text,
+                updated_at,
+                messages
+            )
+            VALUES(?,?,?,?,?,?)
+
+            ON CONFLICT(chat_id) DO UPDATE SET
+                name=CASE
+                    WHEN excluded.name <> ''
+                    THEN excluded.name
+                    ELSE chats.name
+                END,
+
+                username=CASE
+                    WHEN excluded.username <> ''
+                    THEN excluded.username
+                    ELSE chats.username
+                END,
+
+                last_text=excluded.last_text,
+                updated_at=excluded.updated_at,
+                messages=excluded.messages
+        """, (
+            str(chat_id),
+            name or "",
+            username or "",
+            text or "",
+            now,
+            count
+        ))
+
+        conn.commit()
+        conn.close()
+
+
+def get_chats():
+    with db_lock:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM chats
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+
+        conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def save_setting(key, value):
+    with db_lock:
+        conn = db()
+
+        conn.execute("""
+            INSERT INTO settings(key,value)
+            VALUES(?,?)
+
+            ON CONFLICT(key)
+            DO UPDATE SET value=excluded.value
+        """, (
+            key,
+            value
+        ))
+
+        conn.commit()
+        conn.close()
+
+
+def read_setting(key, default=""):
+    with db_lock:
+        conn = db()
+
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (key,)
+        ).fetchone()
+
+        conn.close()
+
+    if row:
+        return row["value"]
+
+    return default
+
+
+init_db()
 
 
 # =========================================================
@@ -34,12 +186,12 @@ lock = threading.Lock()
 def rubika_request(
     token: str,
     method: str,
-    data: Optional[dict] = None
+    data=None
 ):
     token = token.strip()
 
     if not token:
-        raise Exception("توکن خالی است.")
+        raise ValueError("توکن خالی است.")
 
     url = f"{API_BASE}/{token}/{method}"
 
@@ -53,19 +205,19 @@ def rubika_request(
     )
 
     try:
-        result = response.json()
+        payload = response.json()
+
     except Exception:
-        raise Exception(
-            f"پاسخ نامعتبر از روبیکا دریافت شد. "
-            f"HTTP {response.status_code}"
+        raise RuntimeError(
+            f"پاسخ نامعتبر از روبیکا - HTTP {response.status_code}"
         )
 
     if response.status_code >= 400:
-        raise Exception(
-            f"HTTP {response.status_code}: {result}"
+        raise RuntimeError(
+            f"HTTP {response.status_code}: {payload}"
         )
 
-    return result
+    return payload
 
 
 def get_me(token):
@@ -81,7 +233,7 @@ def get_updates(
     offset_id=None
 ):
     data = {
-        "limit": 20
+        "limit": 50
     }
 
     if offset_id:
@@ -110,51 +262,51 @@ def send_message(
 
 
 # =========================================================
-# استخراج اطلاعات Update
+# UPDATE PARSER
 # =========================================================
+
+def find_first(obj, keys):
+    if not isinstance(obj, dict):
+        return None
+
+    for key in keys:
+        value = obj.get(key)
+
+        if value not in (None, ""):
+            return value
+
+    return None
+
 
 def extract_chat_id(update):
     if not isinstance(update, dict):
         return None
 
-    # حالت اصلی
-    value = update.get("chat_id")
-
-    if value:
-        return str(value)
-
-    # حالت‌های احتمالی
-    for key in [
-        "chatId",
-        "object_guid",
-        "objectGuid"
-    ]:
-        value = update.get(key)
-
-        if value:
-            return str(value)
-
-    # داخل پیام
-    for message_key in [
-        "new_message",
-        "message",
-        "updated_message"
-    ]:
-        message = update.get(message_key)
-
-        if not isinstance(message, dict):
-            continue
-
-        for key in [
+    value = find_first(
+        update,
+        [
             "chat_id",
             "chatId",
             "object_guid",
             "objectGuid"
-        ]:
-            value = message.get(key)
+        ]
+    )
 
-            if value:
-                return str(value)
+    if value:
+        return str(value)
+
+    for key in (
+        "new_message",
+        "message",
+        "updated_message",
+        "inline_message"
+    ):
+        value = extract_chat_id(
+            update.get(key)
+        )
+
+        if value:
+            return value
 
     return None
 
@@ -163,215 +315,232 @@ def extract_text(update):
     if not isinstance(update, dict):
         return ""
 
-    for key in [
+    value = find_first(
+        update,
+        [
+            "text",
+            "message_text"
+        ]
+    )
+
+    if value is not None:
+        return str(value)
+
+    for key in (
         "new_message",
         "message",
         "updated_message"
-    ]:
-        message = update.get(key)
+    ):
+        value = extract_text(
+            update.get(key)
+        )
 
-        if isinstance(message, dict):
-
-            text = message.get("text")
-
-            if text is not None:
-                return str(text)
-
-    text = update.get("text")
-
-    if text is not None:
-        return str(text)
+        if value:
+            return value
 
     return ""
 
 
-def extract_sender_name(update):
+def extract_sender(update):
     if not isinstance(update, dict):
-        return ""
+        return "", ""
 
     candidates = [
         update.get("sender"),
         update.get("user"),
-        update.get("from")
+        update.get("from"),
+        update.get("author")
     ]
 
     for obj in candidates:
 
         if isinstance(obj, dict):
 
-            for key in [
-                "first_name",
-                "name",
-                "username",
-                "user_name"
-            ]:
-                value = obj.get(key)
+            name = find_first(
+                obj,
+                [
+                    "first_name",
+                    "name",
+                    "display_name",
+                    "username",
+                    "user_name"
+                ]
+            ) or ""
 
-                if value:
-                    return str(value)
+            username = find_first(
+                obj,
+                [
+                    "username",
+                    "user_name"
+                ]
+            ) or ""
 
-    for message_key in [
+            if name or username:
+                return (
+                    str(name),
+                    str(username)
+                )
+
+    for key in (
         "new_message",
         "message"
-    ]:
-        message = update.get(message_key)
+    ):
 
-        if isinstance(message, dict):
+        name, username = extract_sender(
+            update.get(key)
+        )
 
-            for key in [
-                "first_name",
-                "name",
-                "username",
-                "user_name"
-            ]:
-                value = message.get(key)
+        if name or username:
+            return name, username
 
-                if value:
-                    return str(value)
+    return "", ""
 
-    return ""
+
+def update_list(payload):
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("data")
+
+    if isinstance(data, dict):
+
+        for key in (
+            "updates",
+            "update",
+            "items"
+        ):
+
+            if isinstance(
+                data.get(key),
+                list
+            ):
+                return data[key]
+
+    for key in (
+        "updates",
+        "update",
+        "items"
+    ):
+
+        if isinstance(
+            payload.get(key),
+            list
+        ):
+            return payload[key]
+
+    return []
+
+
+def next_offset(payload):
+
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("data")
+
+    if isinstance(data, dict):
+
+        value = (
+            data.get("next_offset_id")
+            or data.get("next_offset")
+        )
+
+        if value:
+            return str(value)
+
+    value = (
+        payload.get("next_offset_id")
+        or payload.get("next_offset")
+    )
+
+    if value:
+        return str(value)
+
+    return None
 
 
 # =========================================================
-# Bot Worker
+# BOT WORKER
 # =========================================================
 
 def bot_worker(token):
 
-    print("======================================")
-    print("Peti Bot Worker Started")
-    print("======================================")
+    global last_update_offset
+    global bot_info
 
-    offset_id = None
+    print("[Peti] worker started")
 
     while True:
 
         try:
 
-            result = get_updates(
+            payload = get_updates(
                 token,
-                offset_id
+                last_update_offset
             )
 
-            if not isinstance(result, dict):
-                time.sleep(2)
-                continue
+            offset = next_offset(payload)
 
-            # ---------------------------------------------
-            # استخراج data
-            # ---------------------------------------------
+            if offset:
+                last_update_offset = offset
 
-            data = result.get("data")
-
-            if not isinstance(data, dict):
-                data = result
-
-            updates = data.get("updates")
-
-            if not isinstance(updates, list):
-                updates = []
-
-            # ---------------------------------------------
-            # offset بعدی
-            # ---------------------------------------------
-
-            next_offset = (
-                data.get("next_offset_id")
-                or result.get("next_offset_id")
-            )
-
-            if next_offset:
-                offset_id = str(next_offset)
-
-            # ---------------------------------------------
-            # پردازش پیام‌ها
-            # ---------------------------------------------
+            updates = update_list(payload)
 
             for update in updates:
-
-                if not isinstance(update, dict):
-                    continue
 
                 chat_id = extract_chat_id(update)
 
                 if not chat_id:
-                    print(
-                        "Update received but chat_id "
-                        "was not found."
-                    )
                     continue
 
                 text = extract_text(update)
 
-                sender_name = extract_sender_name(update)
+                name, username = extract_sender(
+                    update
+                )
 
-                now = int(time.time())
+                upsert_chat(
+                    chat_id=chat_id,
+                    name=name,
+                    username=username,
+                    text=text
+                )
 
-                # -----------------------------------------
-                # ذخیره چت
-                # -----------------------------------------
-
-                with lock:
-
-                    bot = bots.get(token)
-
-                    if bot is None:
-                        continue
-
-                    chats = bot["chats"]
-
-                    existing = chats.get(chat_id)
-
-                    if existing is None:
-
-                        chats[chat_id] = {
-                            "chat_id": chat_id,
-                            "name": (
-                                sender_name
-                                or "کاربر جدید"
-                            ),
-                            "last_text": text,
-                            "last_update": update,
-                            "updated_at": now,
-                            "messages": 1
-                        }
-
-                        print(
-                            f"NEW CHAT FOUND: {chat_id}"
-                        )
-
-                    else:
-
-                        existing["last_text"] = text
-                        existing["last_update"] = update
-                        existing["updated_at"] = now
-                        existing["messages"] += 1
-
-                        if sender_name:
-                            existing["name"] = sender_name
+                print(
+                    f"[Peti] New message "
+                    f"chat={chat_id} "
+                    f"text={text}"
+                )
 
                 # -----------------------------------------
-                # پاسخ خودکار
+                # /start
                 # -----------------------------------------
 
                 if text.strip() == "/start":
+
+                    start_text = read_setting(
+                        "start_message",
+                        "سلام 👋\nبه ربات پتی خوش آمدید.\nچت شما خودکار شناسایی شد."
+                    )
 
                     try:
 
                         send_message(
                             token,
                             chat_id,
-                            "سلام 👋\n\n"
-                            "به ربات پتی خوش آمدید.\n"
-                            "چت شما با موفقیت شناسایی شد."
+                            start_text
                         )
 
-                    except Exception as e:
+                    except Exception as error:
 
                         print(
-                            "Auto reply error:",
-                            e
+                            "[Peti] start reply error:",
+                            error
                         )
+
+                # -----------------------------------------
+                # /help
+                # -----------------------------------------
 
                 elif text.strip() == "/help":
 
@@ -380,46 +549,74 @@ def bot_worker(token):
                         send_message(
                             token,
                             chat_id,
-                            "🤖 راهنمای ربات پتی\n\n"
-                            "/start - شروع ربات\n"
-                            "/help - راهنما"
+                            "🤖 راهنمای پتی\n\n/start شروع\n/help راهنما"
                         )
 
-                    except Exception as e:
+                    except Exception as error:
 
                         print(
-                            "Help reply error:",
-                            e
+                            "[Peti] help error:",
+                            error
                         )
 
             time.sleep(1)
 
-        except Exception as e:
+        except Exception as error:
 
             print(
-                "Worker error:",
-                repr(e)
+                "[Peti] worker error:",
+                repr(error)
             )
 
             time.sleep(5)
 
 
+def start_worker(token):
+
+    global worker_started
+    global active_token
+
+    with worker_lock:
+
+        if (
+            worker_started
+            and active_token == token
+        ):
+            return
+
+        active_token = token
+        worker_started = True
+
+        thread = threading.Thread(
+            target=bot_worker,
+            args=(token,),
+            daemon=True
+        )
+
+        thread.start()
+
+
 # =========================================================
-# Models
+# MODELS
 # =========================================================
 
 class TokenRequest(BaseModel):
     token: str
 
 
-class SendMessageRequest(BaseModel):
+class SendRequest(BaseModel):
     token: str
     chat_id: str
     text: str
 
 
+class StartMessageRequest(BaseModel):
+    token: str
+    text: str
+
+
 # =========================================================
-# Health
+# API ROUTES
 # =========================================================
 
 @app.get("/health")
@@ -427,16 +624,14 @@ def health():
 
     return {
         "ok": True,
-        "service": "Peti Rubika Bot Builder"
+        "service": "Peti Bot Builder"
     }
 
 
-# =========================================================
-# Verify Token
-# =========================================================
+@app.post("/api/connect")
+def connect(req: TokenRequest):
 
-@app.post("/api/verify-token")
-def verify_token(req: TokenRequest):
+    global bot_info
 
     token = req.token.strip()
 
@@ -444,144 +639,67 @@ def verify_token(req: TokenRequest):
 
         return {
             "ok": False,
-            "message": "توکن وارد نشده است."
+            "message": "توکن را وارد کنید."
         }
 
     try:
 
         result = get_me(token)
 
-        bot_data = result.get(
+        bot_info = result.get(
             "data",
             result
         )
 
-        # ---------------------------------------------
-        # ایجاد حافظه ربات
-        # ---------------------------------------------
+        save_setting(
+            "bot_connected",
+            "1"
+        )
 
-        with lock:
-
-            if token not in bots:
-
-                bots[token] = {
-                    "bot": bot_data,
-                    "chats": {},
-                    "worker_started": False
-                }
-
-            else:
-
-                bots[token]["bot"] = bot_data
-
-            # -----------------------------------------
-            # شروع Worker
-            # -----------------------------------------
-
-            if not bots[token]["worker_started"]:
-
-                bots[token]["worker_started"] = True
-
-                thread = threading.Thread(
-                    target=bot_worker,
-                    args=(token,),
-                    daemon=True
-                )
-
-                thread.start()
+        start_worker(token)
 
         return {
             "ok": True,
             "message": "ربات با موفقیت متصل شد.",
-            "bot": bot_data
+            "bot": bot_info
         }
 
-    except Exception as e:
-
-        print(
-            "Verify token error:",
-            repr(e)
-        )
+    except Exception as error:
 
         return {
             "ok": False,
-            "message": str(e)
+            "message": str(error)
         }
 
-
-# =========================================================
-# گرفتن لیست چت‌ها
-# =========================================================
 
 @app.get("/api/chats")
-def get_chats(token: str):
-
-    token = token.strip()
-
-    if not token:
-
-        return {
-            "ok": False,
-            "message": "توکن وارد نشده است."
-        }
-
-    with lock:
-
-        bot = bots.get(token)
-
-        if not bot:
-
-            return {
-                "ok": False,
-                "message": "ربات هنوز متصل نشده است.",
-                "chats": []
-            }
-
-        chats = list(
-            bot["chats"].values()
-        )
-
-    # جدیدترین‌ها اول
-    chats.sort(
-        key=lambda x: x.get(
-            "updated_at",
-            0
-        ),
-        reverse=True
-    )
+def chats(token: str):
 
     return {
         "ok": True,
-        "chats": chats
+        "chats": get_chats()
     }
 
 
-# =========================================================
-# ارسال پیام به چت انتخاب شده
-# =========================================================
+@app.post("/api/send")
+def send(req: SendRequest):
 
-@app.post("/api/send-message")
-def api_send_message(
-    req: SendMessageRequest
-):
+    if not req.token.strip():
 
-    token = req.token.strip()
-    chat_id = req.chat_id.strip()
-    text = req.text.strip()
-
-    if not token:
         return {
             "ok": False,
             "message": "توکن خالی است."
         }
 
-    if not chat_id:
+    if not req.chat_id.strip():
+
         return {
             "ok": False,
-            "message": "چتی انتخاب نشده است."
+            "message": "یک چت را انتخاب کنید."
         }
 
-    if not text:
+    if not req.text.strip():
+
         return {
             "ok": False,
             "message": "متن پیام خالی است."
@@ -590,371 +708,1266 @@ def api_send_message(
     try:
 
         result = send_message(
-            token,
-            chat_id,
-            text
+            req.token,
+            req.chat_id,
+            req.text
+        )
+
+        upsert_chat(
+            req.chat_id,
+            text="پیام ارسال‌شده: " + req.text
         )
 
         return {
             "ok": True,
-            "message": "پیام ارسال شد.",
             "result": result
         }
 
-    except Exception as e:
-
-        print(
-            "Send message error:",
-            repr(e)
-        )
+    except Exception as error:
 
         return {
             "ok": False,
-            "message": str(e)
+            "message": str(error)
         }
 
 
+@app.post("/api/start-message")
+def start_message(
+    req: StartMessageRequest
+):
+
+    save_setting(
+        "start_message",
+        req.text
+    )
+
+    return {
+        "ok": True,
+        "message": "متن شروع ذخیره شد."
+    }
+
+
+@app.get("/api/settings")
+def settings():
+
+    return {
+        "ok": True,
+        "start_message": read_setting(
+            "start_message",
+            "سلام 👋 به ربات پتی خوش آمدید."
+        )
+    }
+
+
 # =========================================================
-# HTML
+# HTML / UI
 # =========================================================
 
 HTML = r"""
-<!DOCTYPE html>
+<!doctype html>
 
 <html lang="fa" dir="rtl">
 
 <head>
 
-<meta charset="UTF-8">
+<meta charset="utf-8">
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
 
-<title>پتی ربات‌ساز روبیکا</title>
+<title>
+پتی | ربات‌ساز روبیکا
+</title>
 
 <style>
+
+:root{
+
+    --bg:#030918;
+
+    --panel:#071126;
+
+    --panel2:#09162d;
+
+    --line:#12304b;
+
+    --cyan:#13d8ff;
+
+    --blue:#347dff;
+
+    --text:#eef7ff;
+
+    --muted:#7e94b7;
+
+    --green:#31e6a0;
+
+    --danger:#ff6685;
+
+    --shadow:
+        0 18px 55px rgba(0,0,0,.35);
+
+}
 
 *{
     box-sizing:border-box;
 }
 
+html,
 body{
+
     margin:0;
-    min-height:100vh;
+
+    background:var(--bg);
+
+    color:var(--text);
 
     font-family:
         Tahoma,
         Arial,
         sans-serif;
 
-    color:#fff;
+}
 
-    background:
+body{
+
+    background-image:
+
         radial-gradient(
-            circle at top,
-            #12304d,
-            #07111d 50%,
-            #03070d
-        );
-}
+            circle at 78% 12%,
+            rgba(22,170,255,.13),
+            transparent 24%
+        ),
 
-.container{
-    width:min(1050px,94%);
-    margin:35px auto;
-}
-
-.header{
-    text-align:center;
-    margin-bottom:25px;
-}
-
-.logo{
-    width:72px;
-    height:72px;
-
-    margin:auto;
-
-    display:flex;
-    align-items:center;
-    justify-content:center;
-
-    border-radius:22px;
-
-    font-size:34px;
-    font-weight:bold;
-
-    color:#00121d;
-
-    background:
         linear-gradient(
-            135deg,
-            #00e5ff,
-            #087cff
+            rgba(16,58,91,.13) 1px,
+            transparent 1px
+        ),
+
+        linear-gradient(
+            90deg,
+            rgba(16,58,91,.13) 1px,
+            transparent 1px
         );
 
-    box-shadow:
-        0 0 35px
-        rgba(0,220,255,.35);
+    background-size:
+        auto,
+        52px 52px,
+        52px 52px;
+
+    min-height:100vh;
+
 }
 
-h1{
-    margin:15px 0 5px;
-}
-
-.subtitle{
-    color:#8da5b9;
-}
-
-.card{
-    background:
-        rgba(7,22,36,.9);
-
-    border:
-        1px solid
-        rgba(0,220,255,.13);
-
-    border-radius:22px;
-
-    padding:22px;
-
-    margin-bottom:18px;
-
-    box-shadow:
-        0 20px 60px
-        rgba(0,0,0,.25);
-}
-
-.card h2{
-    margin-top:0;
-}
-
-label{
-    display:block;
-
-    color:#9bb1c4;
-
-    margin:
-        12px 0 7px;
-}
-
+button,
 input,
 textarea{
 
-    width:100%;
+    font:inherit;
 
-    background:#06121e;
-
-    border:
-        1px solid
-        #20394c;
-
-    border-radius:13px;
-
-    padding:13px;
-
-    color:#fff;
-
-    outline:none;
-
-    font-size:15px;
-}
-
-input:focus,
-textarea:focus{
-    border-color:#00dcff;
-}
-
-textarea{
-    min-height:100px;
-    resize:vertical;
 }
 
 button{
 
-    border:0;
-
-    border-radius:13px;
-
-    padding:
-        12px 18px;
-
-    margin-top:13px;
-
-    font-weight:bold;
-
     cursor:pointer;
+
+}
+
+.hidden{
+
+    display:none!important;
+
+}
+
+#app{
+
+    min-height:100vh;
+
+}
+
+
+/* TOPBAR */
+
+.topbar{
+
+    height:76px;
+
+    position:sticky;
+
+    top:0;
+
+    z-index:20;
+
+    background:
+        rgba(3,9,24,.88);
+
+    backdrop-filter:
+        blur(18px);
+
+    border-bottom:
+        1px solid
+        rgba(19,216,255,.13);
+
+    display:flex;
+
+    align-items:center;
+
+    justify-content:space-between;
+
+    padding:0 20px;
+
+}
+
+.brand{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:12px;
+
+    font-size:24px;
+
+    font-weight:900;
+
+    color:#18bfff;
+
+}
+
+.brandIcon{
+
+    width:48px;
+
+    height:48px;
+
+    border-radius:15px;
+
+    display:grid;
+
+    place-items:center;
 
     background:
         linear-gradient(
             135deg,
-            #00d9ff,
-            #087cff
+            #10dfff,
+            #3579ff
         );
 
-    color:#00131d;
+    box-shadow:
+        0 0 30px
+        rgba(19,216,255,.35);
+
+    color:#fff;
+
 }
 
-button.secondary{
-    background:#14293a;
-    color:#d7f8ff;
+.top-actions{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:9px;
+
 }
 
-button.danger{
-    background:#301923;
-    color:#ffb5c3;
+.pill{
+
+    border:
+        1px solid #173f55;
+
+    background:#07172a;
+
+    border-radius:30px;
+
+    padding:9px 13px;
+
+    color:#9cb1cc;
+
+    font-size:13px;
+
 }
 
-button:hover{
-    transform:translateY(-1px);
+.dot{
+
+    width:9px;
+
+    height:9px;
+
+    background:var(--green);
+
+    display:inline-block;
+
+    border-radius:50%;
+
+    box-shadow:
+        0 0 14px
+        var(--green);
+
 }
 
-.status{
 
-    margin-top:14px;
-
-    padding:13px;
-
-    border-radius:13px;
-
-    background:#081724;
-
-    color:#91a8bb;
-}
-
-.success{
-    color:#57efad;
-}
-
-.error{
-    color:#ff7272;
-}
+/* LAYOUT */
 
 .layout{
+
+    display:flex;
+
+    min-height:
+        calc(100vh - 76px);
+
+}
+
+.sidebar{
+
+    width:260px;
+
+    flex:none;
+
+    border-left:
+        1px solid
+        rgba(19,216,255,.10);
+
+    background:
+        rgba(4,13,30,.82);
+
+    padding:20px 14px;
+
+}
+
+.nav-title{
+
+    font-size:11px;
+
+    color:#516985;
+
+    padding:
+        12px 12px 8px;
+
+}
+
+.nav{
+
+    width:100%;
+
+    border:
+        1px solid transparent;
+
+    background:transparent;
+
+    color:#8da4c2;
+
+    padding:13px 14px;
+
+    border-radius:14px;
+
+    text-align:right;
+
+    margin:3px 0;
+
+    display:flex;
+
+    gap:11px;
+
+    align-items:center;
+
+}
+
+.nav:hover,
+.nav.active{
+
+    background:
+        linear-gradient(
+            90deg,
+            rgba(16,216,255,.10),
+            rgba(55,121,255,.12)
+        );
+
+    color:#fff;
+
+    border-color:#143c55;
+
+}
+
+.nav b{
+
+    font-size:17px;
+
+    width:22px;
+
+}
+
+.main{
+
+    flex:1;
+
+    padding:24px;
+
+    max-width:1400px;
+
+    margin:auto;
+
+    width:100%;
+
+}
+
+
+/* HERO */
+
+.hero{
+
+    background:
+        linear-gradient(
+            135deg,
+            rgba(12,39,72,.82),
+            rgba(5,17,37,.82)
+        );
+
+    border:
+        1px solid #123958;
+
+    border-radius:26px;
+
+    padding:27px;
+
+    box-shadow:var(--shadow);
+
+    position:relative;
+
+    overflow:hidden;
+
+}
+
+.hero:after{
+
+    content:"";
+
+    position:absolute;
+
+    width:260px;
+
+    height:260px;
+
+    border-radius:50%;
+
+    left:-100px;
+
+    top:-100px;
+
+    background:
+        rgba(19,216,255,.07);
+
+    filter:blur(4px);
+
+}
+
+.hero h1{
+
+    margin:
+        0 0 10px;
+
+    font-size:32px;
+
+}
+
+.hero h1 span{
+
+    color:#19cfff;
+
+}
+
+.hero p{
+
+    margin:0;
+
+    color:#8199ba;
+
+    line-height:2;
+
+}
+
+
+/* STATS */
+
+.grid4{
 
     display:grid;
 
     grid-template-columns:
-        330px 1fr;
+        repeat(4,1fr);
 
-    gap:18px;
+    gap:14px;
+
+    margin-top:16px;
+
 }
 
-.chats{
+.stat{
+
+    background:
+        rgba(7,20,42,.86);
+
+    border:
+        1px solid #12304a;
+
+    border-radius:20px;
+
+    padding:18px;
+
+    box-shadow:var(--shadow);
+
+}
+
+.stat .ico{
+
+    font-size:26px;
+
+    margin-bottom:12px;
+
+}
+
+.stat .num{
+
+    font-size:28px;
+
+    font-weight:900;
+
+}
+
+.stat .label{
+
+    color:#7890ae;
+
+    margin-top:5px;
+
+}
+
+
+/* SECTIONS */
+
+.section-title{
+
+    display:flex;
+
+    align-items:center;
+
+    justify-content:space-between;
+
+    margin:26px 0 12px;
+
+}
+
+.section-title h2{
+
+    font-size:20px;
+
+    margin:0;
+
+}
+
+.section-title span{
+
+    color:#68809f;
+
+    font-size:12px;
+
+}
+
+.grid3{
+
+    display:grid;
+
+    grid-template-columns:
+        repeat(3,1fr);
+
+    gap:16px;
+
+}
+
+.card{
+
+    background:
+        linear-gradient(
+            180deg,
+            rgba(8,21,44,.95),
+            rgba(5,15,31,.95)
+        );
+
+    border:
+        1px solid #12314c;
+
+    border-radius:24px;
+
+    padding:22px;
+
+    box-shadow:var(--shadow);
+
+}
+
+.feature{
+
+    min-height:180px;
+
     display:flex;
 
     flex-direction:column;
 
+    align-items:center;
+
+    text-align:center;
+
+    justify-content:center;
+
+}
+
+.feature .bigicon{
+
+    width:72px;
+
+    height:72px;
+
+    border-radius:22px;
+
+    display:grid;
+
+    place-items:center;
+
+    background:
+        linear-gradient(
+            145deg,
+            #0a2d48,
+            #0a1a32
+        );
+
+    border:
+        1px solid #075b76;
+
+    color:#1cdbff;
+
+    font-size:31px;
+
+    margin-bottom:13px;
+
+}
+
+.feature h3{
+
+    margin:
+        4px 0 7px;
+
+    font-size:18px;
+
+}
+
+.feature p{
+
+    margin:0;
+
+    color:#738bad;
+
+    font-size:13px;
+
+    line-height:1.8;
+
+}
+
+
+/* VIEWS */
+
+.view{
+
+    display:none;
+
+}
+
+.view.active{
+
+    display:block;
+
+}
+
+
+/* FORM */
+
+.field{
+
+    margin:12px 0;
+
+}
+
+.field label{
+
+    display:block;
+
+    color:#8da4c2;
+
+    margin-bottom:7px;
+
+    font-size:13px;
+
+}
+
+.input,
+.textarea{
+
+    width:100%;
+
+    background:#040d1d;
+
+    border:
+        1px solid #163852;
+
+    color:#fff;
+
+    border-radius:14px;
+
+    padding:13px;
+
+    outline:none;
+
+}
+
+.input:focus,
+.textarea:focus{
+
+    border-color:#14d7ff;
+
+    box-shadow:
+        0 0 0 3px
+        rgba(19,216,255,.07);
+
+}
+
+.textarea{
+
+    min-height:120px;
+
+    resize:vertical;
+
+}
+
+
+/* BUTTON */
+
+.btn{
+
+    border:0;
+
+    border-radius:14px;
+
+    padding:12px 17px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #10cfe8,
+            #377cff
+        );
+
+    color:#fff;
+
+    font-weight:800;
+
+    box-shadow:
+        0 10px 25px
+        rgba(28,128,255,.18);
+
+}
+
+.btn.secondary{
+
+    background:#0b1d34;
+
+    border:
+        1px solid #1a3e59;
+
+    color:#b8cbe1;
+
+    box-shadow:none;
+
+}
+
+.btn.danger{
+
+    background:#321526;
+
+    color:#ff9eb3;
+
+}
+
+.btn.full{
+
+    width:100%;
+
+}
+
+.toolbar{
+
+    display:flex;
+
     gap:9px;
 
-    max-height:500px;
+    flex-wrap:wrap;
 
-    overflow-y:auto;
+}
+
+
+/* LOGIN */
+
+.login-wrap{
+
+    min-height:100vh;
+
+    display:grid;
+
+    place-items:center;
+
+    padding:22px;
+
+}
+
+.login-card{
+
+    width:min(520px,100%);
+
+    padding:34px;
+
+    border-radius:30px;
+
+    background:
+        rgba(6,16,36,.94);
+
+    border:
+        1px solid #143c59;
+
+    box-shadow:
+        0 30px 90px
+        rgba(0,0,0,.5);
+
+    text-align:center;
+
+}
+
+.lock{
+
+    width:90px;
+
+    height:90px;
+
+    margin:
+        0 auto 18px;
+
+    border-radius:27px;
+
+    display:grid;
+
+    place-items:center;
+
+    color:#16dcff;
+
+    font-size:42px;
+
+    background:#08203a;
+
+    border:
+        1px solid #0b536c;
+
+    box-shadow:
+        0 0 35px
+        rgba(19,216,255,.12);
+
+}
+
+.login-card h1{
+
+    margin:0 0 8px;
+
+    color:#19cfff;
+
+}
+
+.login-card p{
+
+    color:#778eae;
+
+    line-height:2;
+
+}
+
+.alert{
+
+    margin-top:12px;
+
+    padding:12px;
+
+    border-radius:12px;
+
+    background:#081a2b;
+
+    color:#88a0bc;
+
+    font-size:13px;
+
+}
+
+.alert.ok{
+
+    color:#51e9aa;
+
+}
+
+.alert.err{
+
+    color:#ff718b;
+
+}
+
+
+/* TABLE */
+
+.table{
+
+    width:100%;
+
+    border-collapse:collapse;
+
+}
+
+.table th,
+.table td{
+
+    padding:13px;
+
+    border-bottom:
+        1px solid #12283f;
+
+    text-align:right;
+
+}
+
+.table th{
+
+    color:#6e86a4;
+
+    font-size:12px;
+
+}
+
+.table td{
+
+    font-size:13px;
+
+}
+
+
+/* CHAT */
+
+.chatlist{
+
+    display:grid;
+
+    gap:9px;
+
 }
 
 .chat{
 
-    padding:13px;
+    display:flex;
 
-    border-radius:14px;
+    align-items:center;
 
-    background:#091a2a;
+    justify-content:space-between;
+
+    gap:10px;
+
+    padding:14px;
+
+    border-radius:16px;
+
+    background:#07172a;
 
     border:
-        1px solid
-        #1a3347;
+        1px solid #13334c;
 
     cursor:pointer;
+
 }
 
-.chat:hover{
-    border-color:#00cfee;
+.chat:hover,
+.chat.sel{
+
+    border-color:#13d8ff;
+
+    background:#0a2035;
+
 }
 
-.chat.active{
-    border-color:#00dcff;
+.chat-main{
 
-    background:#0b2537;
+    min-width:0;
+
 }
 
 .chat-name{
-    font-weight:bold;
+
+    font-weight:800;
+
 }
 
 .chat-id{
-    color:#698399;
 
     font-size:11px;
+
+    color:#5f7895;
 
     direction:ltr;
 
     text-align:right;
 
-    margin-top:5px;
 }
 
 .chat-last{
-    color:#8ca5b8;
 
     font-size:12px;
 
-    margin-top:7px;
+    color:#7189a7;
 
     white-space:nowrap;
 
     overflow:hidden;
 
     text-overflow:ellipsis;
+
+    margin-top:5px;
+
 }
 
-.empty{
-    text-align:center;
+.badge{
 
-    padding:25px;
+    font-size:11px;
 
-    color:#687f92;
+    color:#54e9ac;
+
+    background:#062b28;
+
+    padding:5px 8px;
+
+    border-radius:20px;
+
 }
 
-.selected{
 
-    padding:12px;
+/* CONSOLE */
+
+.console{
+
+    background:#020811;
+
+    border:
+        1px solid #12314a;
+
+    border-radius:16px;
+
+    padding:15px;
+
+    min-height:300px;
+
+    color:#76f2c0;
+
+    font-family:monospace;
+
+    white-space:pre-wrap;
+
+    overflow:auto;
+
+}
+
+
+/* SWITCH */
+
+.switch{
+
+    display:inline-flex;
+
+    align-items:center;
+
+    gap:10px;
+
+    color:#4ce7a8;
+
+}
+
+.switch input{
+
+    display:none;
+
+}
+
+.slider{
+
+    width:48px;
+
+    height:26px;
+
+    border-radius:20px;
+
+    background:#25354a;
+
+    position:relative;
+
+}
+
+.slider:after{
+
+    content:"";
+
+    position:absolute;
+
+    width:20px;
+
+    height:20px;
+
+    top:3px;
+
+    right:4px;
+
+    border-radius:50%;
+
+    background:#788da7;
+
+    transition:.2s;
+
+}
+
+.switch input:checked+.slider{
+
+    background:#075c4a;
+
+}
+
+.switch input:checked+.slider:after{
+
+    right:24px;
+
+    background:#31e6a0;
+
+}
+
+
+/* MOBILE */
+
+@media(max-width:900px){
+
+    .sidebar{
+
+        position:fixed;
+
+        right:-280px;
+
+        top:76px;
+
+        height:
+            calc(100vh - 76px);
+
+        z-index:30;
+
+        transition:.25s;
+
+    }
+
+    .sidebar.open{
+
+        right:0;
+
+    }
+
+    .grid4{
+
+        grid-template-columns:
+            repeat(2,1fr);
+
+    }
+
+    .grid3{
+
+        grid-template-columns:
+            1fr 1fr;
+
+    }
+
+    .main{
+
+        padding:15px;
+
+    }
+
+    .menuBtn{
+
+        display:block!important;
+
+    }
+
+}
+
+@media(max-width:600px){
+
+    .grid4,
+    .grid3{
+
+        grid-template-columns:1fr;
+
+    }
+
+    .hero h1{
+
+        font-size:25px;
+
+    }
+
+    .topbar{
+
+        padding:0 11px;
+
+    }
+
+    .brand{
+
+        font-size:20px;
+
+    }
+
+    .main{
+
+        padding:11px;
+
+    }
+
+    .card,
+    .hero{
+
+        border-radius:20px;
+
+        padding:17px;
+
+    }
+
+}
+
+.menuBtn{
+
+    display:none;
+
+    border:
+        1px solid #123c56;
+
+    background:#081a2c;
+
+    color:#17d9ff;
 
     border-radius:12px;
 
-    background:#071925;
-
-    color:#9eb4c6;
-}
-
-.selected strong{
-    color:#4ce9ff;
-}
-
-.top-actions{
-    display:flex;
-
-    gap:8px;
-
-    flex-wrap:wrap;
-}
-
-.small{
-    font-size:12px;
-    color:#7891a5;
-}
-
-.footer{
-    text-align:center;
-
-    color:#5e7488;
-
-    margin:30px 0;
-}
-
-@media(max-width:750px){
-
-    .layout{
-        grid-template-columns:1fr;
-    }
+    padding:9px 12px;
 
 }
 
@@ -962,217 +1975,1195 @@ button:hover{
 
 </head>
 
+
 <body>
 
-<div class="container">
 
+<!-- =====================================================
+LOGIN
+===================================================== -->
 
-    <div class="header">
+<div id="login" class="login-wrap">
 
-        <div class="logo">
-            پ
+    <div class="login-card">
+
+        <div class="lock">
+            🔐
         </div>
 
         <h1>
-            پتی ربات‌ساز
+            ورود به پنل پتی
         </h1>
 
-        <div class="subtitle">
-            مدیریت هوشمند ربات روبیکا
+        <p>
+            توکن ربات روبیکا را وارد کنید
+            تا پنل مدیریت ربات فعال شود.
+        </p>
+
+        <div
+            class="field"
+            style="text-align:right"
+        >
+
+            <label>
+                توکن ربات
+            </label>
+
+            <input
+                id="loginToken"
+                class="input"
+                type="password"
+                placeholder="توکن ربات را وارد کنید"
+            >
+
+        </div>
+
+        <button
+            class="btn full"
+            onclick="connect()"
+        >
+            ثبت و ورود به پنل ←
+        </button>
+
+        <div
+            id="loginAlert"
+            class="alert"
+        >
+            توکن شما در مرورگر ذخیره دائمی نمی‌شود.
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- =====================================================
+APP
+===================================================== -->
+
+<div id="app" class="hidden">
+
+
+<header class="topbar">
+
+    <div class="top-actions">
+
+        <button
+            class="menuBtn"
+            onclick="toggleSide()"
+        >
+            ☰
+        </button>
+
+        <div class="brand">
+
+            <div class="brandIcon">
+                🤖
+            </div>
+
+            پتی
+
         </div>
 
     </div>
 
 
-    <!-- اتصال -->
+    <div class="top-actions">
+
+        <span class="pill">
+
+            <span
+                id="onlineDot"
+                class="dot"
+            ></span>
+
+            ربات روشن
+
+        </span>
+
+        <span
+            id="botNameTop"
+            class="pill"
+        >
+            ربات من
+        </span>
+
+    </div>
+
+</header>
+
+
+<div class="layout">
+
+
+<!-- =====================================================
+SIDEBAR
+===================================================== -->
+
+<aside
+    id="sidebar"
+    class="sidebar"
+>
+
+    <div class="nav-title">
+        مدیریت
+    </div>
+
+    <button
+        class="nav active"
+        onclick="showView('home',this)"
+    >
+
+        <b>⌂</b>
+
+        داشبورد
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('users',this)"
+    >
+
+        <b>♙</b>
+
+        کاربران
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('bots',this)"
+    >
+
+        <b>🤖</b>
+
+        ربات‌ها
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('groups',this)"
+    >
+
+        <b>👥</b>
+
+        گروه‌ها
+
+    </button>
+
+
+    <div class="nav-title">
+        ساخت ربات
+    </div>
+
+
+    <button
+        class="nav"
+        onclick="showView('start',this)"
+    >
+
+        <b>🚀</b>
+
+        متن شروع
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('commands',this)"
+    >
+
+        <b>⌘</b>
+
+        دستورات
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('buttons',this)"
+    >
+
+        <b>⌨</b>
+
+        دکمه‌ها
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('quick',this)"
+    >
+
+        <b>⚡</b>
+
+        پاسخ سریع
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="showView('console',this)"
+    >
+
+        <b>›_</b>
+
+        کنسول
+
+    </button>
+
+
+    <div class="nav-title">
+        سایر
+    </div>
+
+
+    <button
+        class="nav"
+        onclick="showView('settings',this)"
+    >
+
+        <b>⚙</b>
+
+        تنظیمات
+
+    </button>
+
+
+    <button
+        class="nav"
+        onclick="logout()"
+    >
+
+        <b>↪</b>
+
+        خروج
+
+    </button>
+
+</aside>
+
+
+<!-- =====================================================
+MAIN
+===================================================== -->
+
+<main class="main">
+
+
+<!-- =====================================================
+HOME
+===================================================== -->
+
+<section
+    id="home"
+    class="view active"
+>
+
+    <div class="hero">
+
+        <h1>
+
+            ساخت و مدیریت ربات
+
+            <span>
+                پتی
+            </span>
+
+        </h1>
+
+        <p>
+            یک پنل حرفه‌ای برای ساخت،
+            مدیریت و کنترل ربات روبیکا؛
+            با رابط ساده، سریع و کاملاً فارسی.
+        </p>
+
+    </div>
+
+
+    <div class="grid4">
+
+
+        <div class="stat">
+
+            <div class="ico">
+                👤
+            </div>
+
+            <div
+                id="statUsers"
+                class="num"
+            >
+                0
+            </div>
+
+            <div class="label">
+                کاربران شناسایی‌شده
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="ico">
+                💬
+            </div>
+
+            <div
+                id="statChats"
+                class="num"
+            >
+                0
+            </div>
+
+            <div class="label">
+                چت‌های فعال
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="ico">
+                ⚡
+            </div>
+
+            <div
+                id="statMessages"
+                class="num"
+            >
+                0
+            </div>
+
+            <div class="label">
+                پیام‌های دریافت‌شده
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            <div class="ico">
+                🟢
+            </div>
+
+            <div class="num">
+                روشن
+            </div>
+
+            <div class="label">
+                وضعیت ربات
+            </div>
+
+        </div>
+
+
+    </div>
+
+
+    <div class="section-title">
+
+        <h2>
+            امکانات پتی
+        </h2>
+
+        <span>
+            مدیریت سریع
+        </span>
+
+    </div>
+
+
+    <div class="grid3">
+
+
+        <div
+            class="card feature"
+            onclick="showView('start')"
+        >
+
+            <div class="bigicon">
+                🚀
+            </div>
+
+            <h3>
+                متن شروع ربات
+            </h3>
+
+            <p>
+                تنظیم پیام خوش‌آمدگویی و /start
+            </p>
+
+        </div>
+
+
+        <div
+            class="card feature"
+            onclick="showView('console')"
+        >
+
+            <div class="bigicon">
+                ›_
+            </div>
+
+            <h3>
+                کنسول
+            </h3>
+
+            <p>
+                نمایش لاگ‌ها و وضعیت ارتباط ربات
+            </p>
+
+        </div>
+
+
+        <div
+            class="card feature"
+            onclick="showView('buttons')"
+        >
+
+            <div class="bigicon">
+                ⌨
+            </div>
+
+            <h3>
+                دکمه کیبورد
+            </h3>
+
+            <p>
+                مدیریت دکمه‌های تعاملی کیبوردی
+            </p>
+
+        </div>
+
+
+        <div
+            class="card feature"
+            onclick="showView('commands')"
+        >
+
+            <div class="bigicon">
+                ⌘
+            </div>
+
+            <h3>
+                دستورات
+            </h3>
+
+            <p>
+                مدیریت دستورهای سفارشی ربات
+            </p>
+
+        </div>
+
+
+        <div
+            class="card feature"
+            onclick="showView('quick')"
+        >
+
+            <div class="bigicon">
+                ⚡
+            </div>
+
+            <h3>
+                پاسخ سریع
+            </h3>
+
+            <p>
+                پاسخ‌های آماده برای پیام‌های پرتکرار
+            </p>
+
+        </div>
+
+
+        <div
+            class="card feature"
+            onclick="showView('users')"
+        >
+
+            <div class="bigicon">
+                👥
+            </div>
+
+            <h3>
+                مدیریت کاربران
+            </h3>
+
+            <p>
+                کاربرانی که به ربات پیام داده‌اند
+            </p>
+
+        </div>
+
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+USERS
+===================================================== -->
+
+<section
+    id="users"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            مدیریت کاربران و چت‌ها
+        </h2>
+
+        <span>
+            تشخیص خودکار chat_id
+        </span>
+
+    </div>
+
 
     <div class="card">
 
-        <h2>
-            🔐 اتصال ربات
-        </h2>
-
-        <label>
-            توکن ربات
-        </label>
-
-        <input
-            id="token"
-            type="password"
-            placeholder="توکن ربات روبیکا"
-        >
-
-        <div class="top-actions">
-
-            <button onclick="connectBot()">
-                اتصال ربات
-            </button>
+        <div class="toolbar">
 
             <button
-                class="secondary"
-                onclick="refreshChats()"
+                class="btn"
+                onclick="loadChats()"
             >
-                🔄 بروزرسانی چت‌ها
+                🔄 بروزرسانی
             </button>
 
+            <span class="pill">
+                هر پیام جدید خودکار ثبت می‌شود
+            </span>
+
         </div>
+
 
         <div
-            id="status"
-            class="status"
+            id="chatList"
+            class="chatlist"
+            style="margin-top:15px"
         >
-            ربات هنوز متصل نشده است.
         </div>
 
     </div>
 
-
-    <!-- اطلاعات ربات -->
 
     <div
-        id="botCard"
+        id="sendCard"
         class="card"
-        style="display:none"
+        style="margin-top:15px"
     >
 
-        <h2>
-            🤖 ربات
-        </h2>
+        <h3>
+            ✉️ ارسال پیام به چت انتخاب‌شده
+        </h3>
 
-        <div id="botInfo"></div>
+        <div
+            id="selectedInfo"
+            class="alert"
+        >
+            یک چت را انتخاب کنید.
+        </div>
+
+        <textarea
+            id="sendText"
+            class="textarea"
+            placeholder="متن پیام..."
+        >سلام از پتی 👋</textarea>
+
+        <br><br>
+
+        <button
+            class="btn"
+            onclick="sendSelected()"
+        >
+            ارسال پیام
+        </button>
+
+        <div
+            id="sendAlert"
+            class="alert"
+        >
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+BOTS
+===================================================== -->
+
+<section
+    id="bots"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            مدیریت ربات
+        </h2>
 
     </div>
 
 
-    <!-- چت‌ها -->
+    <div class="card">
 
-    <div class="layout">
+        <div id="botDetails">
+            در حال دریافت اطلاعات...
+        </div>
 
+        <div class="alert ok">
 
-        <div class="card">
+            ● اتصال فعال
 
-            <h2>
-                💬 چت‌ها
-            </h2>
+            <br>
 
-            <div class="small">
-                هر کاربری که به ربات پیام بدهد
-                خودکار اینجا اضافه می‌شود.
-            </div>
-
-            <div
-                id="chats"
-                class="chats"
-                style="margin-top:15px"
-            >
-
-                <div class="empty">
-                    هنوز چتی پیدا نشده است.
-                </div>
-
-            </div>
+            دریافت پیام‌ها از طریق getUpdates
 
         </div>
 
+    </div>
 
-        <!-- ارسال -->
+</section>
 
-        <div class="card">
 
-            <h2>
-                ✉️ ارسال پیام
-            </h2>
+<!-- =====================================================
+GROUPS
+===================================================== -->
 
-            <div
-                id="selected"
-                class="selected"
-            >
-                هیچ چتی انتخاب نشده است.
-            </div>
+<section
+    id="groups"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            گروه‌ها
+        </h2>
+
+        <span>
+            نمایش چت‌های شناسایی‌شده
+        </span>
+
+    </div>
+
+
+    <div class="card">
+
+        <p
+            style="
+                color:#8198b5;
+                line-height:2
+            "
+        >
+
+            چت‌های گروهی که به ربات پیام
+            بدهند از همان مسیر شناسایی
+            می‌شوند.
+
+            برای هر چت می‌توانی از بخش
+            کاربران پیام ارسال کنی.
+
+        </p>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+START
+===================================================== -->
+
+<section
+    id="start"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            متن شروع ربات
+        </h2>
+
+        <span>
+            تنظیم پیام خوش‌آمدگویی /start
+        </span>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="field">
 
             <label>
-                متن پیام
+                متن پیام شروع
             </label>
 
             <textarea
-                id="message"
-                placeholder="متن پیام را بنویسید..."
-            >سلام از پتی 👋</textarea>
-
-            <button onclick="sendMessage()">
-                ارسال پیام
-            </button>
-
-            <div
-                id="sendStatus"
-                class="status"
-            >
-                یک چت را انتخاب کنید.
-            </div>
+                id="startText"
+                class="textarea"
+            >سلام 👋 به ربات پتی خوش آمدید.</textarea>
 
         </div>
 
 
+        <button
+            class="btn"
+            onclick="saveStart()"
+        >
+            ذخیره متن شروع
+        </button>
+
+
+        <div
+            id="startAlert"
+            class="alert"
+        >
+            تغییرات را ذخیره کنید.
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+COMMANDS
+===================================================== -->
+
+<section
+    id="commands"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            دستورات سفارشی
+        </h2>
+
+        <span>
+            طراحی و مدیریت دستورها
+        </span>
+
     </div>
 
 
-    <div class="footer">
-        پتی ربات‌ساز روبیکا
+    <div class="card">
+
+        <div class="field">
+
+            <label>
+                نام دستور
+            </label>
+
+            <input
+                id="cmdName"
+                class="input"
+                placeholder="/about"
+            >
+
+        </div>
+
+
+        <div class="field">
+
+            <label>
+                پاسخ دستور
+            </label>
+
+            <textarea
+                id="cmdReply"
+                class="textarea"
+                placeholder="متن پاسخ..."
+            ></textarea>
+
+        </div>
+
+
+        <button
+            class="btn"
+            onclick="addCommand()"
+        >
+            + افزودن دستور
+        </button>
+
+
+        <div
+            id="commandsList"
+            style="margin-top:15px"
+        >
+        </div>
+
     </div>
 
+</section>
+
+
+<!-- =====================================================
+BUTTONS
+===================================================== -->
+
+<section
+    id="buttons"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            دکمه‌های کیبورد
+        </h2>
+
+        <span>
+            مدیریت دکمه‌های تعاملی
+        </span>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="field">
+
+            <label>
+                عنوان دکمه
+            </label>
+
+            <input
+                id="btnName"
+                class="input"
+                placeholder="درباره پتی"
+            >
+
+        </div>
+
+
+        <div class="field">
+
+            <label>
+                متن پاسخ
+            </label>
+
+            <input
+                id="btnReply"
+                class="input"
+                placeholder="پتی یک ربات‌ساز روبیکاست."
+            >
+
+        </div>
+
+
+        <button
+            class="btn"
+            onclick="addButton()"
+        >
+            + افزودن دکمه
+        </button>
+
+
+        <div
+            id="buttonsList"
+            style="margin-top:15px"
+        >
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+QUICK
+===================================================== -->
+
+<section
+    id="quick"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            پاسخ سریع
+        </h2>
+
+        <span>
+            پاسخ آماده به کلمات
+        </span>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="field">
+
+            <label>
+                کلمه یا عبارت
+            </label>
+
+            <input
+                id="quickKey"
+                class="input"
+                placeholder="سلام"
+            >
+
+        </div>
+
+
+        <div class="field">
+
+            <label>
+                پاسخ
+            </label>
+
+            <textarea
+                id="quickReply"
+                class="textarea"
+                placeholder="سلام! خوش آمدید 👋"
+            ></textarea>
+
+        </div>
+
+
+        <button
+            class="btn"
+            onclick="addQuick()"
+        >
+            + افزودن پاسخ سریع
+        </button>
+
+
+        <div
+            id="quickList"
+            style="margin-top:15px"
+        >
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+CONSOLE
+===================================================== -->
+
+<section
+    id="console"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            کنسول
+        </h2>
+
+        <span>
+            نمایش لاگ‌ها و وضعیت
+        </span>
+
+    </div>
+
+
+    <div class="card">
+
+        <div
+            id="consoleBox"
+            class="console"
+        >
+[Peti] waiting for connection...
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =====================================================
+SETTINGS
+===================================================== -->
+
+<section
+    id="settings"
+    class="view"
+>
+
+    <div class="section-title">
+
+        <h2>
+            تنظیمات
+        </h2>
+
+    </div>
+
+
+    <div class="card">
+
+        <label class="switch">
+
+            <input
+                id="botSwitch"
+                type="checkbox"
+                checked
+                onchange="toggleBot(this)"
+            >
+
+            <span class="slider"></span>
+
+            <span>
+                ربات روشن
+            </span>
+
+        </label>
+
+
+        <div class="alert">
+
+            این کلید وضعیت رابط کاربری را
+            کنترل می‌کند.
+
+            Worker دریافت پیام در پس‌زمینه
+            فعال می‌ماند.
+
+        </div>
+
+
+        <button
+            class="btn danger"
+            onclick="logout()"
+        >
+            خروج از پنل
+        </button>
+
+    </div>
+
+</section>
+
+
+</main>
+
+</div>
 
 </div>
 
 
 <script>
 
-let currentToken = "";
+/* =====================================================
+GLOBAL
+===================================================== */
 
-let selectedChatId = "";
+let token = "";
 
-let polling = null;
+let selectedChat = "";
+
+let bot = null;
+
+let poll = null;
+
+let commands =
+    JSON.parse(
+        localStorage.getItem(
+            "peti_commands"
+        ) || "[]"
+    );
+
+let buttons =
+    JSON.parse(
+        localStorage.getItem(
+            "peti_buttons"
+        ) || "[]"
+    );
+
+let quicks =
+    JSON.parse(
+        localStorage.getItem(
+            "peti_quicks"
+        ) || "[]"
+    );
 
 
-/* ========================================================
-   اتصال
-======================================================== */
+function $(id){
 
-async function connectBot(){
+    return document.getElementById(id);
 
-    const token =
-        document
-        .getElementById("token")
+}
+
+
+function esc(value){
+
+    return String(
+        value ?? ""
+    )
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#039;");
+
+}
+
+
+/* =====================================================
+CONNECT
+===================================================== */
+
+async function connect(){
+
+    const t =
+        $("loginToken")
         .value
         .trim();
 
-    const status =
-        document
-        .getElementById("status");
+    if(!t){
 
-    if(!token){
+        $("loginAlert").className =
+            "alert err";
 
-        status.className =
-            "status error";
-
-        status.innerText =
+        $("loginAlert").innerText =
             "توکن را وارد کنید.";
 
         return;
+
     }
 
-    currentToken = token;
+    $("loginAlert").className =
+        "alert";
 
-    status.className =
-        "status";
+    $("loginAlert").innerText =
+        "در حال اتصال...";
 
-    status.innerText =
-        "در حال اتصال به روبیکا...";
 
     try{
 
         const response =
             await fetch(
-                "/api/verify-token",
+                "/api/connect",
                 {
                     method:"POST",
 
@@ -1181,331 +3172,522 @@ async function connectBot(){
                             "application/json"
                     },
 
-                    body:JSON.stringify({
-                        token:token
-                    })
+                    body:
+                        JSON.stringify({
+                            token:t
+                        })
                 }
             );
+
 
         const result =
             await response.json();
 
+
         if(!result.ok){
 
-            status.className =
-                "status error";
+            $("loginAlert").className =
+                "alert err";
 
-            status.innerText =
+            $("loginAlert").innerText =
                 result.message ||
                 "اتصال ناموفق بود.";
 
             return;
+
         }
 
-        status.className =
-            "status success";
 
-        status.innerText =
-            "✅ ربات متصل شد. حالا کاربران می‌توانند به ربات پیام بدهند.";
+        token = t;
 
-        showBot(result.bot);
+        bot =
+            result.bot || {};
 
-        refreshChats();
 
-        startPolling();
+        sessionStorage.setItem(
+            "peti_token",
+            token
+        );
+
+
+        $("login")
+            .classList
+            .add("hidden");
+
+
+        $("app")
+            .classList
+            .remove("hidden");
+
+
+        $("botNameTop").innerText =
+            bot.name ||
+            bot.first_name ||
+            "ربات من";
+
+
+        $("botDetails").innerHTML = `
+
+            <p>
+                نام:
+                <b>
+                    ${esc(
+                        bot.name ||
+                        bot.first_name ||
+                        "نامشخص"
+                    )}
+                </b>
+            </p>
+
+            <p>
+                username:
+                <b>
+                    ${esc(
+                        bot.username ||
+                        bot.user_name ||
+                        "نامشخص"
+                    )}
+                </b>
+            </p>
+
+        `;
+
+
+        log(
+            "connected successfully"
+        );
+
+
+        loadSettings();
+
+        loadChats();
+
+        startPoll();
+
 
     }catch(error){
 
-        status.className =
-            "status error";
+        $("loginAlert").className =
+            "alert err";
 
-        status.innerText =
+        $("loginAlert").innerText =
             "خطا در ارتباط با سرور.";
 
-        console.error(error);
     }
+
 }
 
 
-/* ========================================================
-   اطلاعات ربات
-======================================================== */
+/* =====================================================
+LOGOUT
+===================================================== */
 
-function showBot(bot){
+function logout(){
 
-    const card =
-        document
-        .getElementById("botCard");
+    sessionStorage.removeItem(
+        "peti_token"
+    );
 
-    const info =
-        document
-        .getElementById("botInfo");
+    location.reload();
 
-    card.style.display = "block";
-
-    if(!bot){
-
-        info.innerText =
-            "ربات متصل شد.";
-
-        return;
-    }
-
-    const name =
-        bot.name ||
-        bot.first_name ||
-        "نامشخص";
-
-    const username =
-        bot.username ||
-        bot.user_name ||
-        "نامشخص";
-
-    info.innerHTML = `
-        <p>
-            نام:
-            <strong>
-                ${escapeHtml(name)}
-            </strong>
-        </p>
-
-        <p>
-            username:
-            <strong>
-                ${escapeHtml(username)}
-            </strong>
-        </p>
-    `;
 }
 
 
-/* ========================================================
-   دریافت چت‌ها
-======================================================== */
+/* =====================================================
+SIDEBAR
+===================================================== */
 
-async function refreshChats(){
+function toggleSide(){
 
-    if(!currentToken){
+    $("sidebar")
+        .classList
+        .toggle("open");
+
+}
+
+
+/* =====================================================
+VIEW
+===================================================== */
+
+function showView(
+    id,
+    element
+){
+
+    document
+        .querySelectorAll(".view")
+        .forEach(
+            x =>
+                x.classList.remove(
+                    "active"
+                )
+        );
+
+
+    $(id)
+        .classList
+        .add("active");
+
+
+    document
+        .querySelectorAll(".nav")
+        .forEach(
+            x =>
+                x.classList.remove(
+                    "active"
+                )
+        );
+
+
+    if(element){
+
+        element
+            .classList
+            .add("active");
+
+    }
+
+
+    if(id === "users"){
+
+        loadChats();
+
+    }
+
+
+    if(
+        window.innerWidth < 900
+    ){
+
+        $("sidebar")
+            .classList
+            .remove("open");
+
+    }
+
+}
+
+
+/* =====================================================
+POLL
+===================================================== */
+
+function startPoll(){
+
+    if(poll){
+
+        clearInterval(
+            poll
+        );
+
+    }
+
+    poll =
+        setInterval(
+            loadChats,
+            2500
+        );
+
+}
+
+
+/* =====================================================
+LOAD CHATS
+===================================================== */
+
+async function loadChats(){
+
+    if(!token){
 
         return;
+
     }
+
 
     try{
 
         const response =
             await fetch(
                 "/api/chats?token=" +
-                encodeURIComponent(
-                    currentToken
-                )
+                encodeURIComponent(token)
             );
+
 
         const result =
             await response.json();
 
-        if(!result.ok){
 
-            console.log(
-                result.message
+        if(result.ok){
+
+            renderChats(
+                result.chats || []
             );
 
-            return;
         }
-
-        renderChats(
-            result.chats || []
-        );
 
     }catch(error){
 
-        console.error(error);
+        console.log(error);
+
     }
+
 }
 
 
-/* ========================================================
-   نمایش چت‌ها
-======================================================== */
+/* =====================================================
+RENDER CHATS
+===================================================== */
 
-function renderChats(chats){
+function renderChats(
+    list
+){
+
+    $("statUsers").innerText =
+        list.length;
+
+
+    $("statChats").innerText =
+        list.length;
+
+
+    $("statMessages").innerText =
+        list.reduce(
+            (
+                total,
+                item
+            ) =>
+                total +
+                Number(
+                    item.messages || 0
+                ),
+            0
+        );
+
 
     const box =
-        document
-        .getElementById("chats");
+        $("chatList");
 
-    if(!chats.length){
+
+    if(!list.length){
 
         box.innerHTML = `
-            <div class="empty">
-                هنوز هیچ کاربری به ربات پیام نداده است.
+
+            <div class="alert">
+
+                هنوز هیچ کاربری به ربات
+                پیام نداده است.
+
+                <br><br>
+
+                یک پیام مثل
+
+                <b>
+                    /start
+                </b>
+
+                بفرستید.
+
             </div>
+
         `;
 
         return;
+
     }
 
-    box.innerHTML = "";
 
-    chats.forEach(chat => {
+    box.innerHTML =
+        list.map(
+            chat => `
 
-        const item =
-            document.createElement("div");
+        <div
+            class="
+                chat
+                ${
+                    String(chat.chat_id)
+                    ===
+                    String(selectedChat)
+                    ?
+                    "sel"
+                    :
+                    ""
+                }
+            "
+            onclick="
+                selectChat(
+                    '${esc(chat.chat_id)}',
+                    '${esc(chat.name || "کاربر")}'
+                )
+            "
+        >
 
-        item.className = "chat";
+            <div class="chat-main">
 
-        if(
-            String(chat.chat_id)
-            ===
-            String(selectedChatId)
-        ){
-            item.classList.add("active");
-        }
+                <div class="chat-name">
 
-        item.onclick = () => {
+                    👤
 
-            selectChat(
-                chat.chat_id,
-                chat.name
-            );
+                    ${esc(
+                        chat.name ||
+                        "کاربر"
+                    )}
 
-        };
+                    ${
+                        chat.username
+                        ?
+                        `<span>
+                            @${esc(chat.username)}
+                        </span>`
+                        :
+                        ""
+                    }
 
-        item.innerHTML = `
+                </div>
 
-            <div class="chat-name">
-                👤
-                ${escapeHtml(
-                    chat.name ||
-                    "کاربر"
-                )}
+
+                <div class="chat-id">
+
+                    ${esc(
+                        chat.chat_id
+                    )}
+
+                </div>
+
+
+                <div class="chat-last">
+
+                    ${esc(
+                        chat.last_text ||
+                        "بدون متن"
+                    )}
+
+                </div>
+
             </div>
 
-            <div class="chat-id">
-                ${escapeHtml(
-                    chat.chat_id
-                )}
-            </div>
 
-            <div class="chat-last">
-                ${escapeHtml(
-                    chat.last_text ||
-                    "بدون متن"
-                )}
-            </div>
+            <span class="badge">
 
-        `;
+                ${
+                    Number(
+                        chat.messages || 0
+                    )
+                }
 
-        box.appendChild(item);
+                پیام
 
-    });
+            </span>
+
+        </div>
+
+    `
+        )
+        .join("");
+
 }
 
 
-/* ========================================================
-   انتخاب چت
-======================================================== */
+/* =====================================================
+SELECT CHAT
+===================================================== */
 
 function selectChat(
-    chatId,
+    id,
     name
 ){
 
-    selectedChatId =
-        String(chatId);
+    selectedChat = id;
 
-    document
-        .getElementById("selected")
-        .innerHTML = `
-            چت انتخاب شده:
-            <strong>
-                ${escapeHtml(
-                    name ||
-                    "کاربر"
-                )}
-            </strong>
-            <br>
-            <span
-                style="
+
+    $("selectedInfo").innerHTML = `
+
+        چت انتخاب‌شده:
+
+        <b>
+            ${esc(name)}
+        </b>
+
+        <br>
+
+        <span
+            style="
                 direction:ltr;
-                display:inline-block;
-                margin-top:5px;
-                "
-            >
-                ${escapeHtml(
-                    selectedChatId
-                )}
-            </span>
-        `;
+                display:inline-block
+            "
+        >
+            ${esc(id)}
+        </span>
 
-    document
-        .getElementById("sendStatus")
-        .innerText =
-            "آماده ارسال.";
+    `;
 
-    refreshChats();
+
+    log(
+        "selected chat: " +
+        id
+    );
+
+
+    showView(
+        "users"
+    );
+
+
+    loadChats();
+
 }
 
 
-/* ========================================================
-   ارسال پیام
-======================================================== */
+/* =====================================================
+SEND MESSAGE
+===================================================== */
 
-async function sendMessage(){
+async function sendSelected(){
+
+    if(!selectedChat){
+
+        $("sendAlert").className =
+            "alert err";
+
+        $("sendAlert").innerText =
+            "یک چت را انتخاب کنید.";
+
+        return;
+
+    }
+
 
     const text =
-        document
-        .getElementById("message")
+        $("sendText")
         .value
         .trim();
 
-    const status =
-        document
-        .getElementById("sendStatus");
-
-    if(!currentToken){
-
-        status.className =
-            "status error";
-
-        status.innerText =
-            "ابتدا ربات را متصل کنید.";
-
-        return;
-    }
-
-    if(!selectedChatId){
-
-        status.className =
-            "status error";
-
-        status.innerText =
-            "ابتدا یک چت را انتخاب کنید.";
-
-        return;
-    }
 
     if(!text){
 
-        status.className =
-            "status error";
+        $("sendAlert").className =
+            "alert err";
 
-        status.innerText =
+        $("sendAlert").innerText =
             "متن پیام خالی است.";
 
         return;
+
     }
 
-    status.className =
-        "status";
 
-    status.innerText =
+    $("sendAlert").className =
+        "alert";
+
+    $("sendAlert").innerText =
         "در حال ارسال...";
+
 
     try{
 
         const response =
             await fetch(
-                "/api/send-message",
+                "/api/send",
                 {
                     method:"POST",
 
@@ -1514,111 +3696,568 @@ async function sendMessage(){
                             "application/json"
                     },
 
-                    body:JSON.stringify({
+                    body:
+                        JSON.stringify({
 
-                        token:
-                            currentToken,
+                            token:token,
 
-                        chat_id:
-                            selectedChatId,
+                            chat_id:
+                                selectedChat,
 
-                        text:
-                            text
+                            text:text
 
-                    })
+                        })
+
                 }
             );
+
 
         const result =
             await response.json();
 
+
         if(result.ok){
 
-            status.className =
-                "status success";
+            $("sendAlert").className =
+                "alert ok";
 
-            status.innerText =
-                "✅ پیام با موفقیت ارسال شد.";
+            $("sendAlert").innerText =
+                "پیام با موفقیت ارسال شد.";
+
+            log(
+                "message sent to " +
+                selectedChat
+            );
+
+            loadChats();
 
         }else{
 
-            status.className =
-                "status error";
+            $("sendAlert").className =
+                "alert err";
 
-            status.innerText =
+            $("sendAlert").innerText =
                 result.message ||
                 "ارسال ناموفق بود.";
+
         }
+
 
     }catch(error){
 
-        status.className =
-            "status error";
+        $("sendAlert").className =
+            "alert err";
 
-        status.innerText =
-            "خطا در ارتباط با سرور.";
+        $("sendAlert").innerText =
+            "خطا در ارسال پیام.";
 
-        console.error(error);
-    }
-}
-
-
-/* ========================================================
-   Polling پنل
-======================================================== */
-
-function startPolling(){
-
-    if(polling){
-
-        clearInterval(
-            polling
-        );
     }
 
-    polling =
-        setInterval(
-            refreshChats,
-            2500
-        );
 }
 
 
-/* ========================================================
-   Escape HTML
-======================================================== */
+/* =====================================================
+START MESSAGE
+===================================================== */
 
-function escapeHtml(value){
+async function saveStart(){
 
-    return String(value)
+    const text =
+        $("startText")
+        .value
+        .trim();
 
-        .replaceAll(
-            "&",
-            "&amp;"
-        )
 
-        .replaceAll(
-            "<",
-            "&lt;"
-        )
+    const response =
+        await fetch(
+            "/api/start-message",
+            {
+                method:"POST",
 
-        .replaceAll(
-            ">",
-            "&gt;"
-        )
+                headers:{
+                    "Content-Type":
+                        "application/json"
+                },
 
-        .replaceAll(
-            '"',
-            "&quot;"
-        )
-
-        .replaceAll(
-            "'",
-            "&#039;"
+                body:
+                    JSON.stringify({
+                        token:token,
+                        text:text
+                    })
+            }
         );
+
+
+    const result =
+        await response.json();
+
+
+    $("startAlert").className =
+        result.ok
+        ?
+        "alert ok"
+        :
+        "alert err";
+
+
+    $("startAlert").innerText =
+        result.ok
+        ?
+        "متن شروع ذخیره شد."
+        :
+        "ذخیره ناموفق بود.";
+
 }
+
+
+/* =====================================================
+SETTINGS
+===================================================== */
+
+async function loadSettings(){
+
+    try{
+
+        const response =
+            await fetch(
+                "/api/settings"
+            );
+
+
+        const result =
+            await response.json();
+
+
+        $("startText").value =
+            result.start_message ||
+            "";
+
+    }catch(error){
+
+        console.log(error);
+
+    }
+
+}
+
+
+/* =====================================================
+COMMANDS
+===================================================== */
+
+function addCommand(){
+
+    const name =
+        $("cmdName")
+        .value
+        .trim();
+
+
+    const reply =
+        $("cmdReply")
+        .value
+        .trim();
+
+
+    if(!name || !reply){
+
+        return;
+
+    }
+
+
+    commands.push({
+        n:name,
+        r:reply
+    });
+
+
+    localStorage.setItem(
+        "peti_commands",
+        JSON.stringify(
+            commands
+        )
+    );
+
+
+    $("cmdName").value = "";
+
+    $("cmdReply").value = "";
+
+
+    renderLocal(
+        "commandsList",
+        commands
+    );
+
+}
+
+
+/* =====================================================
+BUTTONS
+===================================================== */
+
+function addButton(){
+
+    const name =
+        $("btnName")
+        .value
+        .trim();
+
+
+    const reply =
+        $("btnReply")
+        .value
+        .trim();
+
+
+    if(!name || !reply){
+
+        return;
+
+    }
+
+
+    buttons.push({
+        n:name,
+        r:reply
+    });
+
+
+    localStorage.setItem(
+        "peti_buttons",
+        JSON.stringify(
+            buttons
+        )
+    );
+
+
+    $("btnName").value = "";
+
+    $("btnReply").value = "";
+
+
+    renderLocal(
+        "buttonsList",
+        buttons
+    );
+
+}
+
+
+/* =====================================================
+QUICK REPLIES
+===================================================== */
+
+function addQuick(){
+
+    const name =
+        $("quickKey")
+        .value
+        .trim();
+
+
+    const reply =
+        $("quickReply")
+        .value
+        .trim();
+
+
+    if(!name || !reply){
+
+        return;
+
+    }
+
+
+    quicks.push({
+        n:name,
+        r:reply
+    });
+
+
+    localStorage.setItem(
+        "peti_quicks",
+        JSON.stringify(
+            quicks
+        )
+    );
+
+
+    $("quickKey").value = "";
+
+    $("quickReply").value = "";
+
+
+    renderLocal(
+        "quickList",
+        quicks
+    );
+
+}
+
+
+/* =====================================================
+LOCAL LIST
+===================================================== */
+
+function renderLocal(
+    id,
+    list
+){
+
+    $(id).innerHTML =
+        list.map(
+            (
+                item,
+                index
+            ) => `
+
+        <div
+            class="chat"
+            style="margin-bottom:8px"
+        >
+
+            <div>
+
+                <b>
+                    ${esc(item.n)}
+                </b>
+
+                <div class="chat-last">
+
+                    ${esc(item.r)}
+
+                </div>
+
+            </div>
+
+
+            <button
+                class="btn danger"
+                onclick="
+                    removeLocal(
+                        '${id}',
+                        ${index}
+                    )
+                "
+            >
+                حذف
+            </button>
+
+        </div>
+
+    `
+        )
+        .join("");
+
+}
+
+
+/* =====================================================
+REMOVE LOCAL
+===================================================== */
+
+function removeLocal(
+    id,
+    index
+){
+
+    if(
+        id ===
+        "commandsList"
+    ){
+
+        commands.splice(
+            index,
+            1
+        );
+
+        localStorage.setItem(
+            "peti_commands",
+            JSON.stringify(
+                commands
+            )
+        );
+
+        renderLocal(
+            id,
+            commands
+        );
+
+    }
+
+
+    if(
+        id ===
+        "buttonsList"
+    ){
+
+        buttons.splice(
+            index,
+            1
+        );
+
+        localStorage.setItem(
+            "peti_buttons",
+            JSON.stringify(
+                buttons
+            )
+        );
+
+        renderLocal(
+            id,
+            buttons
+        );
+
+    }
+
+
+    if(
+        id ===
+        "quickList"
+    ){
+
+        quicks.splice(
+            index,
+            1
+        );
+
+        localStorage.setItem(
+            "peti_quicks",
+            JSON.stringify(
+                quicks
+            )
+        );
+
+        renderLocal(
+            id,
+            quicks
+        );
+
+    }
+
+}
+
+
+/* =====================================================
+CONSOLE
+===================================================== */
+
+function log(
+    text
+){
+
+    const box =
+        $("consoleBox");
+
+
+    if(!box){
+
+        return;
+
+    }
+
+
+    box.innerText +=
+
+        "[" +
+        new Date()
+            .toLocaleTimeString(
+                "fa-IR"
+            ) +
+        "] " +
+        text +
+        "\n";
+
+
+    box.scrollTop =
+        box.scrollHeight;
+
+}
+
+
+/* =====================================================
+BOT SWITCH
+===================================================== */
+
+function toggleBot(
+    element
+){
+
+    if(
+        element.checked
+    ){
+
+        $("onlineDot")
+            .style
+            .background =
+            "#31e6a0";
+
+        log(
+            "bot status: ON"
+        );
+
+    }else{
+
+        $("onlineDot")
+            .style
+            .background =
+            "#ff6685";
+
+        log(
+            "bot status: OFF"
+        );
+
+    }
+
+}
+
+
+/* =====================================================
+PAGE LOAD
+===================================================== */
+
+window.addEventListener(
+    "load",
+    () => {
+
+        renderLocal(
+            "commandsList",
+            commands
+        );
+
+        renderLocal(
+            "buttonsList",
+            buttons
+        );
+
+        renderLocal(
+            "quickList",
+            quicks
+        );
+
+
+        const savedToken =
+            sessionStorage.getItem(
+                "peti_token"
+            );
+
+
+        if(savedToken){
+
+            $("loginToken").value =
+                savedToken;
+
+            connect();
+
+        }
+
+    }
+);
 
 </script>
+
 
 </body>
 
@@ -1658,4 +4297,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port
-                )
+        )
